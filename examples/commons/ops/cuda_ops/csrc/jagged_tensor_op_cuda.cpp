@@ -42,8 +42,8 @@ void concat_2D_jagged_tensors_forward (
     const std::vector<at::Tensor>& offsets_list,
     int64_t seqlen_per_block,
     int64_t max_seqlen,
-    int64_t total_blocks,
-    int64_t blocks,
+    const at::Tensor& total_blocks,
+    const at::Tensor& blocks,
     int64_t threads,
     at::Tensor workload_offset,
     at::Tensor merged_values,
@@ -57,8 +57,8 @@ void concat_2D_jagged_tensors_forward (
         offsets_list,
         (int)seqlen_per_block,
         (int)max_seqlen,
-        (int)total_blocks,
-        (int)blocks,
+        (int)total_blocks.item<int>(),
+        (int)blocks.item<int>(),
         (int)threads,
         workload_offset,
         merged_values,
@@ -104,7 +104,7 @@ void compute_block_workloads(
 }
 
 TORCH_LIBRARY_FRAGMENT(hstu_cuda_ops, m) {
-    m.def("concat_2D_jagged_tensors_forward(Tensor[] values_list, Tensor[] offsets_list, int seqlen_per_block, int max_seqlen, int total_blocks, int blocks, int threads, Tensor workload_offset, Tensor(a!) merged_values, Tensor(b!) merged_offsets) -> ()");
+    m.def("concat_2D_jagged_tensors_forward(Tensor[] values_list, Tensor[] offsets_list, int seqlen_per_block, int max_seqlen, Tensor total_blocks, Tensor blocks, int threads, Tensor workload_offset, Tensor(a!) merged_values, Tensor(b!) merged_offsets) -> ()");
     m.def("concat_2D_jagged_tensors_backward(Tensor grad_output, Tensor grad_lengths, int seqlen_per_block, int max_seqlen, int total_blocks, int blocks, int threads, Tensor workload_offset, Tensor(a!)[] grad_inputs, Tensor[] offsets_list, Tensor merged_offsets) -> ()");
     m.def("compute_block_workloads(Tensor[] offsets_list, int seqlen_per_block, int max_seqlen, Tensor(a!) block_workloads) -> ()");
 }

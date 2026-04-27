@@ -18,10 +18,11 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
             raise ValueError("offsets_list and values_list cannot be empty")
 
         # Check batch_size
-        batch_size = offsets_list[0].size(0) - 1
-        if batch_size <= 0:
-            raise ValueError(
-                f"Invalid batch_size: {batch_size}. offsets tensor size: {offsets_list[0].size()}"
+        batch_size = (offsets_list[0].size(0) - 1) * torch.ones((1,), dtype=torch.int32)
+        if not torch.compiler.is_compiling():
+            if batch_size.item() <= 0:
+                raise ValueError(
+                    f"Invalid batch_size: {batch_size.item()}. offsets tensor size: {offsets_list[0].size()}"
             )
 
         if len(offsets_list) == 1:
@@ -57,10 +58,10 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
 
         device_properties = torch.cuda.get_device_properties(0)
         BLOCK_SIZE = 256
-        GRID_SIZE = int(
+        GRID_SIZE = torch.tensor([
             device_properties.multi_processor_count
             * (device_properties.max_threads_per_multi_processor / BLOCK_SIZE)
-        )
+        ], dtype=torch.int32)
 
         with torch.cuda.nvtx.range("calculate seqlen_per_block", color="purple"):
             # the larger hidden_dim is, the smaller seqlen_per_block becomes
@@ -84,7 +85,7 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
             # warp configuration: ensure not exceeding 1024 threads, each warp processes 1 sequence
             target_warps = min(32, max(1, seqlen_per_block))
             threads = min(BLOCK_SIZE, target_warps * 32)
-            blocks = min(GRID_SIZE, total_blocks)
+            blocks = torch.min(GRID_SIZE, total_blocks)
 
         # Handle max_seqlen == 0 case to prevent division by zero in CUDA kernel
         if max_seqlen == 0:
@@ -119,9 +120,9 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
         # save non-tensor variables
         ctx.seqlen_per_block = seqlen_per_block
         ctx.max_seqlen = max_seqlen
-        ctx.blocks = blocks
+        ctx.blocks = blocks.item()
         ctx.threads = threads
-        ctx.total_blocks = total_blocks
+        ctx.total_blocks = total_blocks.item()
         ctx.input_shapes = [v.shape for v in values_list]
         return merged_values, merged_lengths
 
@@ -169,10 +170,6 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range (0, 10**9)
-        torch._check(x.size(0) > 0)
-        torch._check(x.size(0) < 10**9)
     if x.stride(-1) == 1:
         return x
     return x.contiguous()

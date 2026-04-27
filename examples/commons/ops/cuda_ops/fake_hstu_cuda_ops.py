@@ -25,12 +25,10 @@ def _lengths_splits_fake(lengths_1d, num_splits: int):
     torch._check(lengths_1d.dim() == 1)
     torch._check(num_splits > 0)
 
-    # num_splits is static at export time; the second dim is data-dependent.
-    torch.library.get_ctx()
-    dyn_batch = lengths_1d.size(0) // num_splits
+    # num_splits is static at export time.
     out = []
     for _ in range(num_splits):
-        out.append(lengths_1d.new_empty((dyn_batch,)))
+        out.append(lengths_1d.new_empty((lengths_1d.size(0) // num_splits,)))
     return out
 
 

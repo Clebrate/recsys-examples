@@ -228,6 +228,64 @@ bool run_one_batch(
   return pass_abs_threshold;
 }
 
+bool run_one_round(
+    torch::inductor::AOTIModelPackageLoader& loader,
+    const std::string& dump_dir,
+    std::vector<int> batch_indices,
+    const c10::Device& device) {
+
+  std::vector<torch::Tensor> values_list;
+  std::vector<torch::Tensor> lengths_list;
+  std::vector<torch::Tensor> num_candidates_list;
+  for (int batch_idx : batch_indices) {
+    const std::string values_path = batch_file(dump_dir, batch_idx, "values");
+    const std::string lengths_path = batch_file(dump_dir, batch_idx, "lengths");
+    const std::string num_candidates_path = batch_file(dump_dir, batch_idx, "num_candidates");
+    // const std::string ref_logits_path = batch_file(dump_dir, batch_idx, "ref_logits");
+
+    if (!file_exists(values_path) || !file_exists(lengths_path) ||
+        !file_exists(num_candidates_path)) {
+      std::cerr << "[WARN] Skip batch " << batch_idx
+                << " because one or more dump files are missing.\n";
+      return false;
+    }
+
+    torch::Tensor values_cpu = load_tensor(values_path);
+    torch::Tensor lengths_cpu = load_tensor(lengths_path);
+    torch::Tensor num_candidates_cpu = load_tensor(num_candidates_path);
+    // torch::Tensor ref_logits_cpu = load_tensor(ref_logits_path);
+
+    values_list.push_back(values_cpu.to(device, /*dtype=*/torch::kInt64).contiguous());
+    lengths_list.push_back(lengths_cpu.to(device, /*dtype=*/torch::kInt64).contiguous());
+    num_candidates_list.push_back(num_candidates_cpu.to(device, /*dtype=*/torch::kInt64).contiguous());
+  }
+
+
+  // auto current = c10::cuda::getCurrentCUDAStream();
+  // current.synchronize();
+  std::vector<torch::Tensor> outputs_list;
+  for (int i = 0; i < 3; i++) {
+    cudaDeviceSynchronize();
+    auto start = std::chrono::steady_clock::now();
+    for (int idx : batch_indices) {
+      auto & values = values_list[idx];
+      auto & lengths = lengths_list[idx];
+      auto & num_candidates = num_candidates_list[idx];
+      
+      std::vector<torch::Tensor> outputs = loader.run({values, lengths, num_candidates});
+      outputs_list.push_back(outputs[0]);
+    }
+    // current.synchronize();
+    cudaDeviceSynchronize();
+    auto end = std::chrono::steady_clock::now();
+
+    std::chrono::duration<double> elapsed_seconds = end-start;
+    std::cout << "elapsed time: " << elapsed_seconds.count() << "s\n";
+  }
+
+  return true;
+}
+
 }  // namespace
 
 void load_required_libraries(const DemoConfig& cfg) {
@@ -286,12 +344,13 @@ int main(int argc, char** argv) {
 
     int passed = 0;
     int total = 0;
-    for (int idx : batch_indices) {
-      ++total;
-      if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
-        ++passed;
-      }
-    }
+    // for (int idx : batch_indices) {
+    //   ++total;
+    //   if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
+    //     ++passed;
+    //   }
+    // }
+    run_one_round(loader, cfg.dump_dir, batch_indices, device);
 
     std::cout << "[INFO] max_abs_diff<=0.0625 passed " << passed << "/" << total << " batches.\n";
     return (passed == total) ? 0 : 2;

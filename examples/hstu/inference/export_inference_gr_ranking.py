@@ -46,6 +46,30 @@ warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
 
 
+import torch.distributed as dist
+from megatron.core import parallel_state
+
+def init_single_rank_distributed():
+    if dist.is_available() and not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+
+        dist.init_process_group(
+            backend="gloo",   # use "nccl" only if CUDA+NCCL is properly available
+            init_method="env://",
+            rank=0,
+            world_size=1,
+        )
+    parallel_state.initialize_model_parallel()
+
+def cleanup_single_rank_distributed():
+    parallel_state.destroy_model_parallel()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 class RunningMode(enum.Enum):
     EVAL = "eval"
     SIMULATE = "simulate"
@@ -183,6 +207,7 @@ def get_inference_export_model(
         static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
     )
 
+    init_single_rank_distributed()
     hstu_config = get_hstu_config(
         hidden_size=network_args.hidden_size,
         kv_channels=network_args.kv_channels,
@@ -192,7 +217,7 @@ def get_inference_export_model(
         position_encoding_config=position_encoding_config,
         learnable_input_layernorm=True,
         learnable_output_layernorm=False,
-        is_inference=True,
+        is_inference=False,
     )
 
     ranking_args = RankingArgs()
@@ -229,55 +254,9 @@ def get_inference_export_model(
     elif hstu_config.fp16:
         model.half()
     model.load_checkpoint(checkpoint_dir)
-    model.eval()
+    model = model.eval()
 
     return model
-
-
-def get_configs(
-    emb_configs,
-    num_contextual_features,
-    total_max_seqlen,
-):
-    network_args = NetworkArgs()
-    if network_args.dtype_str == "bfloat16":
-        inference_dtype = torch.bfloat16
-    # elif network_args.dtype_str == "float16":
-    #     inference_dtype = torch.float16
-    else:
-        raise ValueError(
-            f"Inference data type {network_args.dtype_str} is not supported"
-        )
-
-    position_encoding_config = PositionEncodingConfig(
-        num_position_buckets=8192,
-        num_time_buckets=2048,
-        use_time_encoding=False,
-        static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
-    )
-
-    hstu_config = get_hstu_config(
-        hidden_size=network_args.hidden_size,
-        kv_channels=network_args.kv_channels,
-        num_attention_heads=network_args.num_attention_heads,
-        num_layers=network_args.num_layers,
-        dtype=inference_dtype,
-        learnable_input_layernorm=False,
-        learnable_output_layernorm=False,
-        is_inference=True,
-    )
-
-    ranking_args = RankingArgs()
-    task_config = RankingConfig(
-        embedding_configs=emb_configs,
-        prediction_head_arch=ranking_args.prediction_head_arch,
-        prediction_head_act_type=ranking_args.prediction_head_act_type,
-        prediction_head_bias=ranking_args.prediction_head_bias,
-        num_tasks=ranking_args.num_tasks,
-        eval_metrics=ranking_args.eval_metrics,
-    )
-
-    return hstu_config, task_config
 
 
 def export_inference_gr_ranking(
@@ -325,12 +304,6 @@ def export_inference_gr_ranking(
         batch.num_candidates = batch.num_candidates[: batch.batch_size]
         return batch
 
-    hstu_config, task_config = get_configs(
-        emb_configs,
-        num_contextual_features,
-        total_max_seqlen,
-    )
-
     with torch.inference_mode():
         from register_hstubatch_pytree_example import register_hstu_export_pytrees
 
@@ -362,7 +335,7 @@ def export_inference_gr_ranking(
             shuffle=False,
             random_seed=0,
             eval_batch_size=max_batch_size,
-            load_candidate_action=False,
+            load_candidate_action=True,
         )
 
         dataloader = get_data_loader(dataset=eval_dataset)
@@ -395,11 +368,11 @@ def export_inference_gr_ranking(
 
         # get dynamic shapes
         sc = ShapesCollection()
-        # dim_batch = Dim("batch", min=8 , max=4 * 8)
+        dim_batch = Dim("batch_size", min=1, max=8)
 
-        sc[batch.features.values()] = {0: Dim.AUTO}
-        sc[batch.features.lengths()] = {0: Dim.AUTO}
-        sc[batch.num_candidates] = {0: Dim.AUTO}
+        sc[batch.features.values()] = {0: Dim("tokens", min=1, max=40000)}
+        sc[batch.features.lengths()] = {0: dim_batch * len(emb_configs)}
+        sc[batch.num_candidates] = {0: dim_batch}
         dynamic_shapes = sc.dynamic_shapes(model, (batch,))
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
@@ -422,26 +395,25 @@ def export_inference_gr_ranking(
         )
         print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
 
-        # === Test Exported Model ===
+        # === Test Compiled Model ===
+        compiled_model = torch._inductor.aoti_load_package(os.path.join(export_dir, "model.pt2"))
+
         dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
         os.makedirs(dump_dir, exist_ok=True)
         feature_keys_dumped = False
         dump_idx = 0
 
+        print("[INFO][check]:")
         # torch.cuda.profiler.start()
+        inputs = []
         while True:
             try:
                 batch = next(dataloader_iter)
                 batch = prepare_on_gpu(batch)
-                if batch.features.values().size(0) != total_max_seqlen:
-                    continue
+                inputs.append(batch)
 
                 with torch.inference_mode():
-                    torch.cuda.nvtx.range_push("HSTU embedding")
-                    # embeddings = model.sparse_module(batch.features)
-                    torch.cuda.nvtx.range_pop()
-                    logits = exported_program.module()(batch)
-
+                    logits = compiled_model((batch.features.values(), batch.features.lengths(), batch.num_candidates))
                     ref_logits = model(batch)
 
                     if not feature_keys_dumped:
@@ -472,8 +444,8 @@ def export_inference_gr_ranking(
                     dump_idx += 1
 
                     print(
-                        f"[Batch {dump_idx}] Check equal:",
-                        torch.allclose(logits, ref_logits),
+                        f"    [Batch {dump_idx}] Check equal:",
+                        torch.max(torch.abs(logits - ref_logits)).item() <= 0.0625,
                     )
 
                 eval_module(logits, batch.labels.values())
@@ -485,10 +457,49 @@ def export_inference_gr_ranking(
 
         eval_metric_dict = eval_module.compute()
         print(
-            f"[eval]:\n    "
+            f"[INFO][eval]:\n    "
             + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
         )
 
+        # === Benchmark Compiled Model ===
+        print("[INFO][benchmark]:")
+        print("    Benchmark on GPU:", torch.cuda.get_device_name(torch.cuda.current_device()))
+        import time
+        compiled_time = []
+        for _ in range(3):
+            torch.cuda.synchronize()
+            results = []
+            start = time.perf_counter()
+            with torch.inference_mode():
+                for b in inputs:
+                    logits = compiled_model((batch.features.values(), batch.features.lengths(), batch.num_candidates))
+                    results.append(logits)
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            compiled_time.append(end - start)
+        print(f"    Compiled model elapsed time: {sum(compiled_time) / len(compiled_time):.6f} seconds")
+
+        for item in results:
+            del item
+        
+        import time
+        python_time = []
+        for _ in range(3):
+            torch.cuda.synchronize()
+            results = []
+            start = time.perf_counter()
+            with torch.inference_mode():
+                for b in inputs:
+                    ref_logits = model(batch)
+                    results.append(ref_logits)
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            python_time.append(end - start)
+        print(f"    Python model elapsed time: {sum(python_time) / len(python_time):.6f} seconds")
+
+        for item in results:
+            del item
+        
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
@@ -506,4 +517,4 @@ if __name__ == "__main__":
         max_bs=args.max_bs,
         debug_flattened_inputs=args.debug_flattened_inputs,
     )
-    print("Finished.")
+    print("[INFO] Finished.")

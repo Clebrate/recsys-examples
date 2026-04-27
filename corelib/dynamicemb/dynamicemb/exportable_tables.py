@@ -289,9 +289,6 @@ class InferenceEmbeddingTable(torch.nn.Module):
 
         self.emb_dim_ = _resolve_embedding_dim(table_options)
         total_rows = int(self.capacity_list_.sum().item())
-        print(
-            f"[INFO] Total embedding rows: {total_rows}, embedding dim: {self.emb_dim_}"
-        )
         dtype_size = torch.finfo(output_dtype).bits // 8
         total_size_bytes = total_rows * self.emb_dim_ * dtype_size
         self.gpu_cache_size_ = _resolve_gpu_cache_size(table_options, total_size_bytes)
@@ -471,11 +468,9 @@ class InferenceEmbeddingTable(torch.nn.Module):
                         - ``pooling_mode_ == 1 or 2``: ``(B, D)`` float tensor of pooled
               embeddings, where ``B = pooling_offsets.size(0) - 1``.
         """
-        num_elements = keys.size(0)
-
         # Derive per-key table id from the table-segment offsets.
         table_ids = torch.ops.INFERENCE_EMB.expand_table_ids(
-            offsets, keys, self.feature_offsets_, self.num_tables_, 1, num_elements
+            offsets, keys, self.feature_offsets_, self.num_tables_, 1,
         )
 
         # Hash-table lookup: keys → per-table row indices.

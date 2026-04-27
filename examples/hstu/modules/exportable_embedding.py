@@ -82,6 +82,13 @@ from dynamicemb.exportable_tables import InferenceEmbeddingTable
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
+# Register fake impl for nve_ops::embedding_lookup
+@torch.library.register_fake("nve_ops::embedding_lookup", allow_override=True)
+def _f(keys, layer_id):
+    ctx = torch.library.get_ctx()
+    return keys.new_empty((keys.size(0), ctx.new_dynamic_size()), dtype=torch.float32)
+
+
 class ExportableEmbedding(torch.nn.Module):
     """
     ExportableEmbedding is a module for embeddings in the inference stage.
@@ -172,12 +179,11 @@ class ExportableEmbedding(torch.nn.Module):
         )
         offsets[1:] = torch.cumsum(reduce_lengths, dim=0)
         total_embeddings = self._embedding_table(kjt.values(), offsets)
+        torch._check(total_embeddings.size(1) == self._embedding_table.emb_dim_)
         split_embeddings = torch.ops.hstu_cuda_ops.split_by_lengths(
             total_embeddings, reduce_lengths, self.num_features
         )
-        split_lengths = torch.ops.hstu_cuda_ops.lengths_splits(
-            kjt.lengths(), self.num_features
-        )
+        split_lengths = kjt.lengths().view(self.num_features, -1)
         embeddings = {}
         for k in kjt.keys():
             embeddings[k] = JaggedTensor(
