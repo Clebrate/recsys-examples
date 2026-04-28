@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 import itertools
 import math
 from typing import List
@@ -61,6 +62,12 @@ def benchmark_model(
     page_size,
     num_pages,
     offload_chunksize,
+    secondary_backend,
+    flexkv_mode,
+    secondary_wait_timeout_ms,
+    secondary_fail_policy,
+    flexkv_server_addr,
+    flexkv_server_port,
 ):
     feature_configs = [
         FeatureConfig(
@@ -100,6 +107,12 @@ def benchmark_model(
         blocks_in_primary_pool=pages_in_primary_pool,
         page_size=page_size,
         offload_chunksize=offload_chunksize,
+        secondary_backend=secondary_backend,
+        flexkv_mode=flexkv_mode,
+        secondary_wait_timeout_ms=secondary_wait_timeout_ms,
+        secondary_fail_policy=secondary_fail_policy,
+        flexkv_server_addr=flexkv_server_addr,
+        flexkv_server_port=flexkv_server_port,
     )
     emb_configs = [
         InferenceEmbeddingConfig(
@@ -257,7 +270,9 @@ def run_single_bench(
         num_targets,  # total_history_length + num_targets <= max_seqlen (already doubled)
         # global config
         model._hstu_config.max_seq_len,
-        num_targets,
+        # Keep max_num_candidates from model config even when num_targets=0,
+        # so JaggedData remains consistent and "no-candidate" cases can run.
+        model._jagged_metadata.max_num_candidates,
         0,
         model._hstu_config.num_layers,
         model._embedding_dim,
@@ -405,7 +420,14 @@ def run_single_bench(
         print("time(ms)", ts_start.elapsed_time(ts_end) / num_iterations)
 
 
-def run_benchmark():
+def run_benchmark(
+    secondary_backend: str,
+    flexkv_mode: str,
+    secondary_wait_timeout_ms: int,
+    secondary_fail_policy: str,
+    flexkv_server_addr: str,
+    flexkv_server_port: int,
+):
     kwargs = {
         # model config
         "embedding_dim": 1024,
@@ -425,6 +447,12 @@ def run_benchmark():
         "page_size": 32,
         "num_pages": 10240,
         "offload_chunksize": 1024,
+        "secondary_backend": secondary_backend,
+        "flexkv_mode": flexkv_mode,
+        "secondary_wait_timeout_ms": secondary_wait_timeout_ms,
+        "secondary_fail_policy": secondary_fail_policy,
+        "flexkv_server_addr": flexkv_server_addr,
+        "flexkv_server_port": flexkv_server_port,
     }
     print()
 
@@ -448,7 +476,7 @@ def run_benchmark():
             # new_history_length
             [128, 256, 512, 1024, 2048, 4096],
             # num_targets
-            [256],
+            [0, 256],
         ):
             # skips
             if new_history_length > total_history_length:
@@ -485,4 +513,37 @@ def run_benchmark():
 
 
 if __name__ == "__main__":
-    run_benchmark()
+    parser = argparse.ArgumentParser(
+        description="Paged HSTU benchmark with configurable secondary backend"
+    )
+    parser.add_argument(
+        "--secondary_backend",
+        type=str,
+        default="nop",
+        choices=["nop", "flexkv"],
+    )
+    parser.add_argument(
+        "--flexkv_mode",
+        type=str,
+        default="direct",
+        choices=["direct", "server_client"],
+    )
+    parser.add_argument("--secondary_wait_timeout_ms", type=int, default=0)
+    parser.add_argument(
+        "--secondary_fail_policy",
+        type=str,
+        default="fail_open",
+        choices=["fail_open", "fail_close"],
+    )
+    parser.add_argument("--flexkv_server_addr", type=str, default="")
+    parser.add_argument("--flexkv_server_port", type=int, default=0)
+
+    args = parser.parse_args()
+    run_benchmark(
+        secondary_backend=args.secondary_backend,
+        flexkv_mode=args.flexkv_mode,
+        secondary_wait_timeout_ms=args.secondary_wait_timeout_ms,
+        secondary_fail_policy=args.secondary_fail_policy,
+        flexkv_server_addr=args.flexkv_server_addr,
+        flexkv_server_port=args.flexkv_server_port,
+    )

@@ -30,7 +30,17 @@ sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
 
 
-def run_ranking_gr_inference(disable_kvcache: bool):
+def run_ranking_gr_inference(
+    disable_kvcache: bool,
+    secondary_backend: str,
+    flexkv_mode: str,
+    secondary_wait_timeout_ms: int,
+    secondary_fail_policy: str,
+    flexkv_server_addr: str,
+    flexkv_server_port: int,
+    data_max_batch_size: int,
+    data_max_num_users: int,
+):
     max_batch_size = 16
     max_num_history = 2048
     max_num_candidates = 256
@@ -80,6 +90,12 @@ def run_ranking_gr_inference(disable_kvcache: bool):
         blocks_in_primary_pool=_blocks_in_primary_pool,
         page_size=_page_size,
         offload_chunksize=_offload_chunksize,
+        secondary_backend=secondary_backend,
+        flexkv_mode=flexkv_mode,
+        secondary_wait_timeout_ms=secondary_wait_timeout_ms,
+        secondary_fail_policy=secondary_fail_policy,
+        flexkv_server_addr=flexkv_server_addr,
+        flexkv_server_port=flexkv_server_port,
     )
     emb_configs = [
         InferenceEmbeddingConfig(
@@ -122,9 +138,11 @@ def run_ranking_gr_inference(disable_kvcache: bool):
             item_feature_name=item_fea_name,
             contextual_feature_names=[],
             action_feature_name=action_fea_name,
-            max_num_users=1,
-            max_batch_size=1,  # test batch size
-            max_history_length=max_num_history,
+            max_num_users=data_max_num_users,
+            max_batch_size=data_max_batch_size,
+            # RandomInferenceDataset uses range(..., max_history_length, ...),
+            # so +1 is needed to include the 2048 endpoint (=> total len 4096).
+            max_history_length=max_num_history + 1,
             max_num_candidates=max_num_candidates,
             max_incremental_seqlen=max_incremental_seqlen,
             max_num_cached_batches=16,
@@ -136,6 +154,12 @@ def run_ranking_gr_inference(disable_kvcache: bool):
         # Warm up
         for batch, user_ids, total_history_lengths in dataloader:
             model_predict.forward_nokvcache(batch)
+            # if not disable_kvcache:
+            #     model_predict.forward_with_kvcache(
+            #         batch, user_ids, total_history_lengths
+            #     )
+            # else:
+            #     model_predict.forward_nokvcache(batch)
 
         dataloader = get_data_loader(dataset)
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
@@ -155,6 +179,39 @@ def run_ranking_gr_inference(disable_kvcache: bool):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference KVCache Demo Benchmark")
     parser.add_argument("--disable_kvcache", action="store_true")
+    parser.add_argument(
+        "--secondary_backend",
+        type=str,
+        default="nop",
+        choices=["nop", "flexkv"],
+    )
+    parser.add_argument(
+        "--flexkv_mode",
+        type=str,
+        default="direct",
+        choices=["direct", "server_client"],
+    )
+    parser.add_argument("--secondary_wait_timeout_ms", type=int, default=0)
+    parser.add_argument(
+        "--secondary_fail_policy",
+        type=str,
+        default="fail_open",
+        choices=["fail_open", "fail_close"],
+    )
+    parser.add_argument("--flexkv_server_addr", type=str, default="")
+    parser.add_argument("--flexkv_server_port", type=int, default=0)
+    parser.add_argument("--data_max_batch_size", type=int, default=8)
+    parser.add_argument("--data_max_num_users", type=int, default=8)
 
     args = parser.parse_args()
-    run_ranking_gr_inference(args.disable_kvcache)
+    run_ranking_gr_inference(
+        disable_kvcache=args.disable_kvcache,
+        secondary_backend=args.secondary_backend,
+        flexkv_mode=args.flexkv_mode,
+        secondary_wait_timeout_ms=args.secondary_wait_timeout_ms,
+        secondary_fail_policy=args.secondary_fail_policy,
+        flexkv_server_addr=args.flexkv_server_addr,
+        flexkv_server_port=args.flexkv_server_port,
+        data_max_batch_size=args.data_max_batch_size,
+        data_max_num_users=args.data_max_num_users,
+    )

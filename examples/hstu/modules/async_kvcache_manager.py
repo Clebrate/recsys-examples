@@ -1066,7 +1066,17 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             dp_size=1,
             dtype=torch.bfloat16,
         )
-        cache_cfg = CacheConfig(tokens_per_block=self.page_size)
+        # cache_cfg = CacheConfig(tokens_per_block=self.page_size)
+        cpu_blocks = int(os.environ.get("FLEXKV_NUM_CPU_BLOCKS", "8192"))
+        local_blocks = int(os.environ.get("FLEXKV_NUM_LOCAL_BLOCKS", str(cpu_blocks)))
+        tmp_cpu_blocks = int(os.environ.get("FLEXKV_NUM_TMP_CPU_BLOCKS", "256"))
+        cache_cfg = CacheConfig(
+            tokens_per_block=self.page_size,
+            enable_cpu=True,
+            num_tmp_cpu_blocks=tmp_cpu_blocks,
+            num_cpu_blocks=cpu_blocks,
+            num_local_blocks=local_blocks,
+        )
 
         client = KVManager(
             model_config=model_cfg,
