@@ -24,6 +24,12 @@ import torch
 from commons.sequence_batch.batch import BaseBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+_DYNAMIC_SHAPES = getattr(getattr(torch, "export", None), "dynamic_shapes", None)
+_INT_WRAPPER_CLS = (
+    getattr(_DYNAMIC_SHAPES, "_IntWrapper", None) if _DYNAMIC_SHAPES is not None else None
+)
+_INT_LIKE_TYPES = (int,) if _INT_WRAPPER_CLS is None else (int, _INT_WRAPPER_CLS)
+
 
 class DistType(str, Enum):
     """Supported random distribution types.
@@ -249,9 +255,9 @@ class HSTUBatch(BaseBatch):
         assert self.action_feature_name is None or isinstance(
             self.action_feature_name, str
         ), "action_feature_name must be None or a string"
-        assert isinstance(
-            self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
-        ), "max_num_candidates must be an int"
+        assert isinstance(self.max_num_candidates, _INT_LIKE_TYPES), (
+            "max_num_candidates must be an int"
+        )
 
     def num_loss_tokens(self) -> torch.Tensor:
         """Per-rank loss token count (pre-TP, as a scalar tensor).

@@ -324,6 +324,10 @@ class InferenceDenseModule(torch.nn.Module):
         lookup_result: Optional[Any] = None,
     ):
         with torch.inference_mode():
+            nvtx_enabled = (
+                os.getenv("NVTX_E2E", "1").strip().lower()
+                not in {"0", "false", "off", "no"}
+            )
             old_cached_lengths = torch.tensor(
                 prepare_kvcache_result.old_cached_lengths, dtype=torch.int32
             )
@@ -334,11 +338,15 @@ class InferenceDenseModule(torch.nn.Module):
             kvcache_metadata_fut = prepare_kvcache_result.kvcache_metadata_fut
             onload_fut = prepare_kvcache_result.onload_fut
 
+            if nvtx_enabled:
+                torch.cuda.nvtx.range_push("E2E: preprocess")
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,
                 seq_start_position=old_cached_lengths.cuda(),
             )
+            if nvtx_enabled:
+                torch.cuda.nvtx.range_pop()
             jagged_data.scaling_seqlen = self._scaling_seqlen
 
             kvcache_metadata = self.async_kvcache.prepare_kvcache_wait(
@@ -386,6 +394,8 @@ class InferenceDenseModule(torch.nn.Module):
                 copy_jagged_metadata(self._jagged_metadata, jagged_data)
                 copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
 
+                if nvtx_enabled:
+                    torch.cuda.nvtx.range_push("E2E: hstublock")
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,
@@ -393,8 +403,12 @@ class InferenceDenseModule(torch.nn.Module):
                     self._jagged_metadata,
                     kvcache_metadata,
                 )
+                if nvtx_enabled:
+                    torch.cuda.nvtx.range_pop()
                 jagged_data.values = hstu_output
             else:
+                if nvtx_enabled:
+                    torch.cuda.nvtx.range_push("E2E: hstublock")
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,
@@ -402,6 +416,8 @@ class InferenceDenseModule(torch.nn.Module):
                     jagged_data,
                     kvcache_metadata,
                 )
+                if nvtx_enabled:
+                    torch.cuda.nvtx.range_pop()
                 jagged_data.values = hstu_output
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)

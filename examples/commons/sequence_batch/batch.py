@@ -6,6 +6,19 @@ import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 
+_DYNAMIC_SHAPES = getattr(getattr(torch, "export", None), "dynamic_shapes", None)
+_INT_WRAPPER_CLS = (
+    getattr(_DYNAMIC_SHAPES, "_IntWrapper", None) if _DYNAMIC_SHAPES is not None else None
+)
+
+
+def _is_compatible_int(value: Any) -> bool:
+    if isinstance(value, int):
+        return value > 0
+    if _INT_WRAPPER_CLS is not None and isinstance(value, _INT_WRAPPER_CLS):
+        return value.val > 0
+    return False
+
 
 @dataclass
 class BaseBatch(Pipelineable):
@@ -33,12 +46,7 @@ class BaseBatch(Pipelineable):
         if len(set(self.features.keys())) != len(list(self.features.keys())):
             raise ValueError(f"duplicate features keys {list(self.features.keys())}")
         assert isinstance(self.contextual_feature_names, list)
-        assert (
-            isinstance(self.batch_size, int)
-            and self.batch_size > 0
-            or isinstance(self.batch_size, torch.export.dynamic_shapes._IntWrapper)
-            and self.batch_size.val > 0
-        )
+        assert _is_compatible_int(self.batch_size)
         self.actual_batch_size = (
             self.batch_size
             if self.actual_batch_size is None

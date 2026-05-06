@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
 import torch
@@ -39,6 +40,20 @@ class InferenceRankingGR(torch.nn.Module):
         super().__init__()
         self.sparse_module = sparse_module
         self.dense_module = dense_module
+        self._nvtx_e2e_enabled = (
+            os.getenv("NVTX_E2E", "1").strip().lower()
+            not in {"0", "false", "off", "no"}
+        )
+
+    @contextmanager
+    def _nvtx_range(self, name: str):
+        if self._nvtx_e2e_enabled:
+            torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            if self._nvtx_e2e_enabled:
+                torch.cuda.nvtx.range_pop()
 
     def bfloat16(self):
         """
@@ -210,47 +225,57 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            lookup_token_ids, lookup_token_mask = self._build_lookup_tokens_from_batch(
-                batch=batch,
-                total_history_lengths=total_history_lengths,
-            )
-            lookup_result = self.dense_module.async_kvcache.lookup_kvcache(
-                user_ids,
-                total_history_lengths,
-                token_ids=lookup_token_ids,
-                token_mask=lookup_token_mask,
-            )
-            self.dense_module.async_kvcache.finish_or_cancel_kvcache_ops()
-            kv_index_meta, prepare_result = (
-                self.dense_module.async_kvcache.allocate_kvcache(
+            with self._nvtx_range("E2E: build lookup tokens"):
+                lookup_token_ids, lookup_token_mask = self._build_lookup_tokens_from_batch(
+                    batch=batch,
+                    total_history_lengths=total_history_lengths,
+                )
+
+            with self._nvtx_range("E2E: lookup kvcache"):
+                lookup_result = self.dense_module.async_kvcache.lookup_kvcache(
+                    user_ids,
+                    total_history_lengths,
+                    token_ids=lookup_token_ids,
+                    token_mask=lookup_token_mask,
+                )
+
+            with self._nvtx_range("E2E: finish or cancel kvcache ops"):
+                self.dense_module.async_kvcache.finish_or_cancel_kvcache_ops()
+
+            with self._nvtx_range("E2E: allocate kvcache"):
+                kv_index_meta, prepare_result = (
+                    self.dense_module.async_kvcache.allocate_kvcache(
+                        lookup_result,
+                    )
+                )
+
+            with self._nvtx_range("E2E: strip cached tokens"):
+                old_cached_lengths = torch.tensor(
+                    lookup_result.old_cached_lengths, dtype=torch.int32
+                )
+                striped_batch = self.dense_module.async_kvcache.strip_cached_tokens(
+                    batch,
+                    old_cached_lengths,
+                )
+
+            with self._nvtx_range("E2E: embedding"):
+                embeddings = self.sparse_module(striped_batch.features)
+
+            with self._nvtx_range("E2E: forward with kvcache"):
+                logits = self.dense_module.forward_with_kvcache(
+                    striped_batch,
+                    embeddings,
+                    user_ids,
+                    total_history_lengths,
+                    prepare_result,
+                    kv_index_meta,
                     lookup_result,
                 )
-            )
 
-            old_cached_lengths = torch.tensor(
-                lookup_result.old_cached_lengths, dtype=torch.int32
-            )
-            striped_batch = self.dense_module.async_kvcache.strip_cached_tokens(
-                batch,
-                old_cached_lengths,
-            )
-
-            torch.cuda.nvtx.range_push("HSTU embedding")
-            embeddings = self.sparse_module(striped_batch.features)
-            torch.cuda.nvtx.range_pop()
-
-            logits = self.dense_module.forward_with_kvcache(
-                striped_batch,
-                embeddings,
-                user_ids,
-                total_history_lengths,
-                prepare_result,
-                kv_index_meta,
-                lookup_result,
-            )
-            self.dense_module.async_kvcache.lazy_offload_kvcache(
-                kv_index_meta
-            )
+            with self._nvtx_range("E2E: lazy offload kvcache"):
+                self.dense_module.async_kvcache.lazy_offload_kvcache(
+                    kv_index_meta
+                )
 
         return logits
 
@@ -259,9 +284,8 @@ class InferenceRankingGR(torch.nn.Module):
         batch: HSTUBatch,
     ):
         with torch.inference_mode():
-            torch.cuda.nvtx.range_push("HSTU embedding")
-            embeddings = self.sparse_module(batch.features)
-            torch.cuda.nvtx.range_pop()
+            with self._nvtx_range("E2E: embedding"):
+                embeddings = self.sparse_module(batch.features)
             logits = self.dense_module.forward_nokvcache(batch, embeddings)
 
         return logits
@@ -271,9 +295,8 @@ class InferenceRankingGR(torch.nn.Module):
         batch: HSTUBatch,
     ):
         with torch.inference_mode():
-            torch.cuda.nvtx.range_push("HSTU embedding")
-            embeddings = self.sparse_module(batch.features)
-            torch.cuda.nvtx.range_pop()
+            with self._nvtx_range("E2E: embedding"):
+                embeddings = self.sparse_module(batch.features)
             logits = self.dense_module(batch, embeddings)
         return logits
 
