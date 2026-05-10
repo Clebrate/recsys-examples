@@ -470,7 +470,11 @@ class InferenceEmbeddingTable(torch.nn.Module):
         """
         # Derive per-key table id from the table-segment offsets.
         table_ids = torch.ops.INFERENCE_EMB.expand_table_ids(
-            offsets, keys, self.feature_offsets_, self.num_tables_, 1,
+            offsets,
+            keys,
+            self.feature_offsets_,
+            self.num_tables_,
+            1,
         )
 
         # Hash-table lookup: keys → per-table row indices.

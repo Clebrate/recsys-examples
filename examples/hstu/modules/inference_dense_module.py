@@ -151,17 +151,25 @@ class InferenceDenseModule(torch.nn.Module):
             ), "hstu layer hidden size should equal to embedding dim"
 
         self._hstu_block = (
-            HSTUBlock(hstu_config)
-            if self._use_exportable
-            else HSTUBlockInference(hstu_config, kvcache_config)
-        )  if hstu_block is None else hstu_block
-        self._mlp = MLP(
-            self._embedding_dim,
-            task_config.prediction_head_arch,
-            task_config.prediction_head_act_type,
-            task_config.prediction_head_bias,
-            device=self._device,
-        ) if mlp is None else mlp
+            (
+                HSTUBlock(hstu_config)
+                if self._use_exportable
+                else HSTUBlockInference(hstu_config, kvcache_config)
+            )
+            if hstu_block is None
+            else hstu_block
+        )
+        self._mlp = (
+            MLP(
+                self._embedding_dim,
+                task_config.prediction_head_arch,
+                task_config.prediction_head_act_type,
+                task_config.prediction_head_bias,
+                device=self._device,
+            )
+            if mlp is None
+            else mlp
+        )
 
         self._hstu_block = self._hstu_block.cuda()
         self._mlp = self._mlp.cuda()

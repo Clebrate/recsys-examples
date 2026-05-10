@@ -493,7 +493,9 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             if not torch.compiler.is_compiling():
                 sequence_embeddings = sequence_embeddings[0::2, ...]
             else:
-                sequence_embeddings = sequence_embeddings.view(sequence_embeddings.size(0) // 2, 2, -1)
+                sequence_embeddings = sequence_embeddings.view(
+                    sequence_embeddings.size(0) // 2, 2, -1
+                )
                 sequence_embeddings = sequence_embeddings[:, 0, ...]
             seqlen_offsets = seqlen_offsets // 2
             max_seqlen = max_seqlen // 2

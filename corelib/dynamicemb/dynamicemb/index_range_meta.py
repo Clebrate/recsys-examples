@@ -46,7 +46,7 @@ def _expand_table_ids_fake(
 
     if num_elements < 0:
         raise RuntimeError("INFERENCE_EMB::expand_table_ids expects num_elements >= 0")
-    
+
     return torch.empty_like(indices, dtype=torch.int64)
 
 

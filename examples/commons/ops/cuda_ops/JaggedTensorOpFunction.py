@@ -23,7 +23,7 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
             if batch_size.item() <= 0:
                 raise ValueError(
                     f"Invalid batch_size: {batch_size.item()}. offsets tensor size: {offsets_list[0].size()}"
-            )
+                )
 
         if len(offsets_list) == 1:
             single_offsets = offsets_list[0]
@@ -58,10 +58,13 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
 
         device_properties = torch.cuda.get_device_properties(0)
         BLOCK_SIZE = 256
-        GRID_SIZE = torch.tensor([
-            device_properties.multi_processor_count
-            * (device_properties.max_threads_per_multi_processor / BLOCK_SIZE)
-        ], dtype=torch.int32)
+        GRID_SIZE = torch.tensor(
+            [
+                device_properties.multi_processor_count
+                * (device_properties.max_threads_per_multi_processor / BLOCK_SIZE)
+            ],
+            dtype=torch.int32,
+        )
 
         with torch.cuda.nvtx.range("calculate seqlen_per_block", color="purple"):
             # the larger hidden_dim is, the smaller seqlen_per_block becomes

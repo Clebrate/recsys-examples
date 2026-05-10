@@ -14,45 +14,37 @@
 # limitations under the License.
 import argparse
 import enum
-import math
 import os
 import sys
 import warnings
+from typing import Dict, List
 
 import gin
 import torch
+import torch.distributed as dist
 from commons.datasets import get_data_loader
 from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
-from configs import (
-    InferenceEmbeddingConfig,
-    RankingConfig,
-)
-from modules.exportable_embedding import ExportableEmbedding, apply_inference_embedding
-from modules.inference_dense_module import InferenceDenseModule, get_inference_dense_model
+from configs import InferenceEmbeddingConfig
+from megatron.core import parallel_state
+from model import get_ranking_model
+from model.inference_ranking_gr import InferenceRankingGR
+from modules.exportable_embedding import apply_inference_embedding
+from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from utils import DatasetArgs, NetworkArgs, RankingArgs, TensorModelParallelArgs
-from model import get_ranking_model
+from utils import DatasetArgs, NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
-from trainer.utils import (
-    create_hstu_config,
-    get_dataset_and_embedding_args,
-)
 from pretrain_gr_ranking import create_ranking_config
-
-from model.inference_ranking_gr import InferenceRankingGR
+from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
 
-
-import torch.distributed as dist
-from megatron.core import parallel_state
 
 def init_single_rank_distributed():
     if dist.is_available() and not dist.is_initialized():
@@ -62,12 +54,13 @@ def init_single_rank_distributed():
         os.environ.setdefault("WORLD_SIZE", "1")
 
         dist.init_process_group(
-            backend="gloo",   # use "nccl" only if CUDA+NCCL is properly available
+            backend="gloo",  # use "nccl" only if CUDA+NCCL is properly available
             init_method="env://",
             rank=0,
             world_size=1,
         )
     parallel_state.initialize_model_parallel()
+
 
 def cleanup_single_rank_distributed():
     parallel_state.destroy_model_parallel()
@@ -200,14 +193,15 @@ def get_training_gr_model():
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
     return model
 
+
 def apply_inference(
     training_model: torch.nn.Module,
-    inference_emb_table_order: "List[str]",
-    trained_emb_table_sizes: "Dict[str, int]",
+    inference_emb_table_order: List[str],
+    trained_emb_table_sizes: Dict[str, int],
     checkpoint_dir: str,
 ):
     model = apply_inference_embedding(
-        training_model, 
+        training_model,
         table_order=inference_emb_table_order,
         trained_emb_table_sizes=trained_emb_table_sizes,
     )
@@ -244,8 +238,12 @@ def get_exportable_model_for_inference(
     model = get_training_gr_model()
     inference_model = apply_inference(
         model,
-        inference_emb_table_order=[config.table_name for config in inference_emb_configs],
-        trained_emb_table_sizes={config.table_name: config.vocab_size for config in inference_emb_configs},
+        inference_emb_table_order=[
+            config.table_name for config in inference_emb_configs
+        ],
+        trained_emb_table_sizes={
+            config.table_name: config.vocab_size for config in inference_emb_configs
+        },
         checkpoint_dir=checkpoint_dir,
     )
     return inference_model
@@ -371,9 +369,7 @@ def export_inference_gr_ranking(
 
         # export & aoti_compile_and_package
         export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
-        export_aot(
-            model, (batch,), export_dir, dynamic_shapes=dynamic_shapes
-        )
+        export_aot(model, (batch,), export_dir, dynamic_shapes=dynamic_shapes)
         print(f"[INFO] Exported and packaged the model to:")
         print(f"       {export_dir}/")
         print(
@@ -385,7 +381,9 @@ def export_inference_gr_ranking(
         print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
 
         # === Test Compiled Model ===
-        compiled_model = torch._inductor.aoti_load_package(os.path.join(export_dir, "model.pt2"))
+        compiled_model = torch._inductor.aoti_load_package(
+            os.path.join(export_dir, "model.pt2")
+        )
 
         dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
         os.makedirs(dump_dir, exist_ok=True)
@@ -402,7 +400,13 @@ def export_inference_gr_ranking(
                 inputs.append(batch)
 
                 with torch.inference_mode():
-                    logits = compiled_model((batch.features.values(), batch.features.lengths(), batch.num_candidates))
+                    logits = compiled_model(
+                        (
+                            batch.features.values(),
+                            batch.features.lengths(),
+                            batch.num_candidates,
+                        )
+                    )
                     ref_logits = model(batch)
 
                     if not feature_keys_dumped:
@@ -452,8 +456,12 @@ def export_inference_gr_ranking(
 
         # === Benchmark Compiled Model ===
         print("[INFO][benchmark]:")
-        print("    Benchmark on GPU:", torch.cuda.get_device_name(torch.cuda.current_device()))
+        print(
+            "    Benchmark on GPU:",
+            torch.cuda.get_device_name(torch.cuda.current_device()),
+        )
         import time
+
         compiled_time = []
         for _ in range(3):
             torch.cuda.synchronize()
@@ -461,17 +469,26 @@ def export_inference_gr_ranking(
             start = time.perf_counter()
             with torch.inference_mode():
                 for b in inputs:
-                    logits = compiled_model((batch.features.values(), batch.features.lengths(), batch.num_candidates))
+                    logits = compiled_model(
+                        (
+                            batch.features.values(),
+                            batch.features.lengths(),
+                            batch.num_candidates,
+                        )
+                    )
                     results.append(logits)
             torch.cuda.synchronize()
             end = time.perf_counter()
             compiled_time.append(end - start)
-        print(f"    Compiled model elapsed time: {sum(compiled_time) / len(compiled_time):.6f} seconds")
+        print(
+            f"    Compiled model elapsed time: {sum(compiled_time) / len(compiled_time):.6f} seconds"
+        )
 
         for item in results:
             del item
-        
+
         import time
+
         python_time = []
         for _ in range(3):
             torch.cuda.synchronize()
@@ -484,11 +501,13 @@ def export_inference_gr_ranking(
             torch.cuda.synchronize()
             end = time.perf_counter()
             python_time.append(end - start)
-        print(f"    Python model elapsed time: {sum(python_time) / len(python_time):.6f} seconds")
+        print(
+            f"    Python model elapsed time: {sum(python_time) / len(python_time):.6f} seconds"
+        )
 
         for item in results:
             del item
-        
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
