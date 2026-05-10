@@ -131,6 +131,8 @@ class InferenceDenseModule(torch.nn.Module):
         use_cudagraph: bool = False,
         cudagraph_configs: Optional[Dict[int, Any]] = None,
         use_exportable: bool = False,
+        hstu_block: Optional[torch.nn.Module] = None,
+        mlp: Optional[torch.nn.Module] = None,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
@@ -152,14 +154,14 @@ class InferenceDenseModule(torch.nn.Module):
             HSTUBlock(hstu_config)
             if self._use_exportable
             else HSTUBlockInference(hstu_config, kvcache_config)
-        )
+        )  if hstu_block is None else hstu_block
         self._mlp = MLP(
             self._embedding_dim,
             task_config.prediction_head_arch,
             task_config.prediction_head_act_type,
             task_config.prediction_head_bias,
             device=self._device,
-        )
+        ) if mlp is None else mlp
 
         self._hstu_block = self._hstu_block.cuda()
         self._mlp = self._mlp.cuda()

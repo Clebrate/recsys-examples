@@ -72,6 +72,7 @@ import commons.ops.cuda_ops.fake_hstu_cuda_ops  # noqa: F401 – registers fake 
 # ---------------------------------------------------------------------------
 
 
+from commons.modules.embedding import ShardedEmbedding
 from configs import InferenceEmbeddingConfig
 from dynamicemb import (
     DynamicEmbInitializerArgs,
@@ -109,7 +110,6 @@ class ExportableEmbedding(torch.nn.Module):
 
         self.table_options = [
             DynamicEmbTableOptions(
-                index_type=torch.int64,
                 embedding_dtype=torch.float32,
                 dim=config.dim,
                 max_capacity=config.vocab_size,
@@ -201,3 +201,54 @@ def get_exportable_embedding(
         embedding_configs,
         feature_to_index,
     )
+
+
+def apply_inference_embedding(
+    model: torch.nn.Module, 
+    table_order: List[str],
+    trained_emb_table_sizes: Dict[str, int],
+    feature_to_index: Optional[Dict[str, int]] = None,
+):
+    """
+    Replace the sharded embedding in the model with the exportable embedding for inference.
+
+    Args:
+        model (torch.nn.Module): The input model.
+        table_order (List[str]): The order of the embedding tables. 
+            This should match the order of the tables in the training model's sharded embedding collection.
+        trained_emb_table_sizes (Dict[str, int]): A dictionary mapping table names to their corresponding vocabulary sizes in the trained model.
+        feature_to_index (Optional[Dict[str, int]]): Mapping from feature names to their indices.
+            The inference jagged input should be ordered based on the indices in this mapping. 
+            For example, if the input features are ["fea1", "fea2", "fea3"] and the mapping is 
+            {"fea1": 0, "fea2": 2, "fea3": 1}, then the input features should be ordered as 
+            ["fea1", "fea3", "fea2"] when feeding into the model for inference.
+
+    Returns:
+        torch.nn.Module: The model with the exportable embedding.
+    """
+
+    for name, module in model.named_modules():
+        if isinstance(module, ShardedEmbedding):
+            embedding_configs = module._model_parallel_embedding_collection.embedding_configs() + \
+                                module._data_parallel_embedding_collection.embedding_configs()
+            
+            inference_emb_configs = dict()
+            for config in embedding_configs:
+                table_name = config.name
+                if table_name not in trained_emb_table_sizes:
+                    raise ValueError(f"Trained table size for {table_name} not found in trained_emb_table_sizes.")
+                inference_emb_configs[table_name] = InferenceEmbeddingConfig(
+                    table_name=table_name,
+                    feature_names=config.feature_names,
+                    vocab_size=trained_emb_table_sizes[table_name],
+                    dim=config.embedding_dim,
+                    use_dynamicemb=True,  # using Dynamicemb Hashing and NVE Embedding Layers
+                )
+
+            exportable_embedding = get_exportable_embedding(
+                [ inference_emb_configs[table_name] for table_name in table_order ],
+                feature_to_index,
+            )
+            exportable_embedding.eval()
+            setattr(model, name, exportable_embedding)
+    return model

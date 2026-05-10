@@ -27,20 +27,25 @@ from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import (
     InferenceEmbeddingConfig,
-    PositionEncodingConfig,
     RankingConfig,
-    get_hstu_config,
 )
-from modules.exportable_embedding import ExportableEmbedding
-from modules.inference_dense_module import get_inference_dense_model
+from modules.exportable_embedding import ExportableEmbedding, apply_inference_embedding
+from modules.inference_dense_module import InferenceDenseModule, get_inference_dense_model
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from utils import DatasetArgs, NetworkArgs, RankingArgs
+from utils import DatasetArgs, NetworkArgs, RankingArgs, TensorModelParallelArgs
+from model import get_ranking_model
 
-sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR
+sys.path.append("./training/")
+from trainer.utils import (
+    create_hstu_config,
+    get_dataset_and_embedding_args,
+)
+from pretrain_gr_ranking import create_ranking_config
+
+from model.inference_ranking_gr import InferenceRankingGR
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
@@ -183,80 +188,67 @@ def get_inference_dataset_and_embedding_configs(
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
 
-def get_inference_export_model(
-    emb_configs,
-    max_batch_size,
-    num_contextual_features,
-    total_max_seqlen,
-    checkpoint_dir,
-):
+def get_training_gr_model():
+    dataset_args, embedding_args = get_dataset_and_embedding_args(False)
     network_args = NetworkArgs()
-    if network_args.dtype_str == "bfloat16":
-        inference_dtype = torch.bfloat16
-    # elif network_args.dtype_str == "float16":
-    #     inference_dtype = torch.float16
-    else:
-        raise ValueError(
-            f"Inference data type {network_args.dtype_str} is not supported"
-        )
-
-    position_encoding_config = PositionEncodingConfig(
-        num_position_buckets=8192,
-        num_time_buckets=2048,
-        use_time_encoding=False,
-        static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
-    )
 
     init_single_rank_distributed()
-    hstu_config = get_hstu_config(
-        hidden_size=network_args.hidden_size,
-        kv_channels=network_args.kv_channels,
-        num_attention_heads=network_args.num_attention_heads,
-        num_layers=network_args.num_layers,
-        dtype=inference_dtype,
-        position_encoding_config=position_encoding_config,
-        learnable_input_layernorm=True,
-        learnable_output_layernorm=False,
-        is_inference=False,
+    hstu_config = create_hstu_config(network_args, TensorModelParallelArgs())
+    hstu_config.learnable_output_layernorm = False
+    task_config = create_ranking_config(dataset_args, network_args, embedding_args)
+
+    model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
+    return model
+
+def apply_inference(
+    training_model: torch.nn.Module,
+    inference_emb_table_order: "List[str]",
+    trained_emb_table_sizes: "Dict[str, int]",
+    checkpoint_dir: str,
+):
+    model = apply_inference_embedding(
+        training_model, 
+        table_order=inference_emb_table_order,
+        trained_emb_table_sizes=trained_emb_table_sizes,
     )
 
-    ranking_args = RankingArgs()
-    task_config = RankingConfig(
-        embedding_configs=emb_configs,
-        prediction_head_arch=ranking_args.prediction_head_arch,
-        prediction_head_act_type=ranking_args.prediction_head_act_type,
-        prediction_head_bias=ranking_args.prediction_head_bias,
-        num_tasks=ranking_args.num_tasks,
-        eval_metrics=ranking_args.eval_metrics,
-    )
-
-    sparse_module = ExportableEmbedding(emb_configs)
-    sparse_module.eval()
-
-    dense_module = get_inference_dense_model(
-        hstu_config,
-        None,  # kvcache_config is not needed for export
-        task_config,
+    dense_module = InferenceDenseModule(
+        hstu_config=model._hstu_config,
+        kvcache_config=None,  # kvcache_config is not needed for export
+        task_config=model._task_config,
         use_exportable=True,
+        hstu_block=model._hstu_block,
+        mlp=model._mlp,
     )
-    if hstu_config.bf16:
-        dense_module.bfloat16()
-    elif hstu_config.fp16:
-        dense_module.half()
     dense_module.eval()
 
-    model = InferenceRankingGR(
-        sparse_module,
+    inference_model = InferenceRankingGR(
+        model._embedding_collection,
         dense_module,
     )
-    if hstu_config.bf16:
-        model.bfloat16()
-    elif hstu_config.fp16:
-        model.half()
-    model.load_checkpoint(checkpoint_dir)
-    model = model.eval()
+    if model._hstu_config.bf16:
+        inference_model.bfloat16()
+    elif model._hstu_config.fp16:
+        inference_model.half()
 
-    return model
+    inference_model.load_checkpoint(checkpoint_dir)
+    inference_model = inference_model.eval()
+
+    return inference_model
+
+
+def get_exportable_model_for_inference(
+    inference_emb_configs,
+    checkpoint_dir,
+):
+    model = get_training_gr_model()
+    inference_model = apply_inference(
+        model,
+        inference_emb_table_order=[config.table_name for config in inference_emb_configs],
+        trained_emb_table_sizes={config.table_name: config.vocab_size for config in inference_emb_configs},
+        checkpoint_dir=checkpoint_dir,
+    )
+    return inference_model
 
 
 def export_inference_gr_ranking(
@@ -279,7 +271,7 @@ def export_inference_gr_ranking(
         wrapper = _TensorWrapper(tensor)
         torch.jit.script(wrapper).save(path)
 
-    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
+    dataset_args, inference_emb_configs = get_inference_dataset_and_embedding_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = len(dataproc._contextual_feature_names)
@@ -309,11 +301,8 @@ def export_inference_gr_ranking(
 
         register_hstu_export_pytrees()
 
-        model = get_inference_export_model(
-            emb_configs,
-            max_batch_size,
-            num_contextual_features,
-            total_max_seqlen,
+        model = get_exportable_model_for_inference(
+            inference_emb_configs,
             checkpoint_dir,
         )
 
@@ -371,7 +360,7 @@ def export_inference_gr_ranking(
         dim_batch = Dim("batch_size", min=1, max=8)
 
         sc[batch.features.values()] = {0: Dim("tokens", min=1, max=40000)}
-        sc[batch.features.lengths()] = {0: dim_batch * len(emb_configs)}
+        sc[batch.features.lengths()] = {0: dim_batch * len(inference_emb_configs)}
         sc[batch.num_candidates] = {0: dim_batch}
         dynamic_shapes = sc.dynamic_shapes(model, (batch,))
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
@@ -382,7 +371,7 @@ def export_inference_gr_ranking(
 
         # export & aoti_compile_and_package
         export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
-        exported_program = export_aot(
+        export_aot(
             model, (batch,), export_dir, dynamic_shapes=dynamic_shapes
         )
         print(f"[INFO] Exported and packaged the model to:")
