@@ -3,7 +3,6 @@ ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE} AS devel
 ARG TARGETPLATFORM
-ARG INFERENCEBUILD
 ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/deps
@@ -85,6 +84,8 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     rm nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz && \
     cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
+    cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" pip3 install --no-build-isolation . && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
       ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
