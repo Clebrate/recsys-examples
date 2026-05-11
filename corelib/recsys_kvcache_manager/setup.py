@@ -15,12 +15,10 @@
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
 
 library_name = "recsys_kvcache_manager"
 root_path: Path = Path(__file__).resolve().parent
@@ -85,7 +83,12 @@ def get_extensions():
             name="kvcache_cpp",
             sources=cuda_sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++20", "-DWITH_PYBIND11=1", "-fvisibility=hidden"],
+                "cxx": [
+                    "-O3",
+                    "-std=c++20",
+                    "-DWITH_PYBIND11=1",
+                    "-fvisibility=hidden",
+                ],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
             include_dirs=include_dirs,
@@ -97,6 +100,7 @@ def get_extensions():
 
 class NinjaBuildExtension(BuildExtension):
     """Custom build extension with Ninja support and memory management."""
+
     def __init__(self, *args, **kwargs) -> None:
         # Do not override env MAX_JOBS if already exists
         if not os.environ.get("MAX_JOBS"):

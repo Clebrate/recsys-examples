@@ -10,9 +10,6 @@ from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from torchrec.sparse.jagged_tensor import JaggedTensor
-from recsys_kvcache_manager.kvcache_metadata import (
-    copy_kvcache_metadata,
-)
 
 
 class HSTUBlockInference(torch.nn.Module):

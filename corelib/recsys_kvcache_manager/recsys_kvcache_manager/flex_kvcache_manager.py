@@ -1,30 +1,23 @@
-import math
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from typing import Any, Callable, List, Dict, Optional, Tuple, Union
-from dataclasses import dataclass
-from abc import ABC, abstractmethod
-from enum import Enum
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.server.client import KVTPClient
 
 from .host_kvstorage_manager import (
     HostKVStorageManagerBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
     HostKVWaitResult,
-    HostKVStorageErrorCode,
 )
-from .kvcache_utils import FlexKVIndexMeta, KVIndexMeta, KVLookupResult
-from uuid import uuid4
 from .kvcache_metadata import KVCacheMetadata
+from .kvcache_utils import FlexKVIndexMeta, KVIndexMeta, KVLookupResult
 
-from flexkv.server.client import KVTPClient
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 @dataclass
 class _FlexKVOnloadHandle:
@@ -32,11 +25,13 @@ class _FlexKVOnloadHandle:
     uids: torch.Tensor
     slot_mappings: List[torch.Tensor]
 
+
 @dataclass
 class _FlexKVOffloadHandle:
     task_ids: List[int]
     uids: torch.Tensor
     seqlens: torch.Tensor
+
 
 class FlexKVStorageManager(HostKVStorageManagerBase):
     def __init__(
@@ -81,19 +76,24 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self._ready = False
 
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
-        assert len(cache_table_list) == self.num_layers, f"cache_table_list length {len(cache_table_list)} does not match num_layers {self.num_layers}"
+        assert (
+            len(cache_table_list) == self.num_layers
+        ), f"cache_table_list length {len(cache_table_list)} does not match num_layers {self.num_layers}"
 
         # Use fake view (2, #block, blocksize, #head, headdim) for flexKV registration.
         # Actual data will be organized in the original GPU cache tensors shape (#block, 2, blocksize, #head, headdim).
         self._gpu_cache_table_list = [
-            cache_table.permute((1, 0, 2, 3, 4)) for cache_table in cache_table_list  # Generate a view by no calling to contiguous() .
+            cache_table.permute((1, 0, 2, 3, 4))
+            for cache_table in cache_table_list  # Generate a view by no calling to contiguous() .
         ]
 
         # Initialize FlexKV client only after GPU cache table is available.
         self._init_client()
 
         first_table = self._gpu_cache_table_list[0]
-        device_id = int(first_table.device.index if first_table.device.index is not None else 0)
+        device_id = int(
+            first_table.device.index if first_table.device.index is not None else 0
+        )
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=len(self._gpu_cache_table_list),
@@ -108,7 +108,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             dp_client_id=0,
             device_id=device_id,
         )
-        tp_client.register_to_server(kv_caches=self._gpu_cache_table_list, kv_layout=gpu_layout)
+        tp_client.register_to_server(
+            kv_caches=self._gpu_cache_table_list, kv_layout=gpu_layout
+        )
         self._registered = True
 
         # Client becomes operational only after transfer manager is ready.
@@ -122,8 +124,8 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         if self._client is not None:
             return
         try:
+            from flexkv.common.config import CacheConfig, ModelConfig
             from flexkv.kvmanager import KVManager
-            from flexkv.common.config import ModelConfig, CacheConfig
         except Exception as e:
             raise RuntimeError(f"FlexKV SDK import failed: {e}") from e
         if "FLEXKV_ENABLE_MPS" not in os.environ:
@@ -151,7 +153,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             dp_client_id=0,
         )
         self._client.start()
-    
+
     # - Applies timeout when hostkv_wait_timeout_ms > 0.
     # - Maps FlexKV wait responses into HostKVTaskStatus.
     def _try_wait_offload_and_map_result(
@@ -159,7 +161,6 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         task_ids: List[int],
         user_ids: List[int],
     ) -> HostKVWaitResult:
-
         responses = self._client.try_wait(task_ids)
 
         has_unready = False
@@ -188,7 +189,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         #     )
         if has_failed or has_cancelled:
             return HostKVWaitResult(
-                status=HostKVTaskStatus.CANCELLED if has_cancelled and not has_failed else HostKVTaskStatus.FAILED,
+                status=HostKVTaskStatus.CANCELLED
+                if has_cancelled and not has_failed
+                else HostKVTaskStatus.FAILED,
                 ready=False,
                 message=";".join(msgs),
                 failed_user_ids=user_ids,
@@ -204,15 +207,21 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
 
     def build_index_meta(
         self,
-        user_ids: torch.Tensor,                 # CPU Tensor
-        history_sequence_lengths: torch.Tensor, # CPU Tensor
+        user_ids: torch.Tensor,  # CPU Tensor
+        history_sequence_lengths: torch.Tensor,  # CPU Tensor
     ) -> FlexKVIndexMeta:
-        user_ids_t = user_ids if user_ids.dtype == torch.int64 else user_ids.to(torch.int64)
+        user_ids_t = (
+            user_ids if user_ids.dtype == torch.int64 else user_ids.to(torch.int64)
+        )
         seq_lengths_t = history_sequence_lengths.to(dtype=torch.int32)
         bsz = user_ids_t.size(0)
 
-        token_ids = [ torch.arange(seq_lengths_t[i], dtype=torch.int64) for i in range(bsz) ]
-        token_mask = [ None for _ in range(bsz) ] # No mask generation. For partial onboarding, we clip token_ids to mark the onboard length
+        token_ids = [
+            torch.arange(seq_lengths_t[i], dtype=torch.int64) for i in range(bsz)
+        ]
+        token_mask = [
+            None for _ in range(bsz)
+        ]  # No mask generation. For partial onboarding, we clip token_ids to mark the onboard length
         namespaces = [f"uid:{int(uid)}" for uid in user_ids_t.tolist()]
         return FlexKVIndexMeta(
             user_ids=user_ids_t,
@@ -224,10 +233,12 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         )
 
     def lookup_kvcache(self, index_meta: KVIndexMeta) -> KVLookupResult:
-        device = index_meta.user_ids.device
+        index_meta.user_ids.device
 
         if getattr(index_meta, "namespaces", None) is None:
-            index_meta.namespaces = [f"uid:{int(uid)}" for uid in index_meta.user_ids.detach().cpu().tolist()]
+            index_meta.namespaces = [
+                f"uid:{int(uid)}" for uid in index_meta.user_ids.detach().cpu().tolist()
+            ]
 
         requests = self._adapter.to_get_match_requests(index_meta)
         task_ids: List[int] = []
@@ -238,7 +249,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 task_ids.append(-1)
                 matched_lengths.append(0)
                 continue
-            
+
             task_id, matched_mask = self._client.get_match(
                 token_ids=req["token_ids"],
                 token_mask=req["token_mask"],
@@ -262,19 +273,27 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             },
         )
 
-    def _build_slot_mappings(self, kvcache_metadata: KVCacheMetadata) -> List[torch.Tensor]:
+    def _build_slot_mappings(
+        self, kvcache_metadata: KVCacheMetadata
+    ) -> List[torch.Tensor]:
         mappings: List[torch.Tensor] = []
         kv_indices = kvcache_metadata.kv_indices
         kv_indptr = kvcache_metadata.kv_indptr
         for i in range(kv_indptr.size(0) - 1):
-            page_ids = kv_indices[kv_indptr[i]:kv_indptr[i + 1]]
+            page_ids = kv_indices[kv_indptr[i] : kv_indptr[i + 1]]
             if page_ids.numel() == 0:
-                mappings.append(torch.empty((0,), dtype=torch.int64, device=kv_indices.device))
+                mappings.append(
+                    torch.empty((0,), dtype=torch.int64, device=kv_indices.device)
+                )
                 continue
             # page_ids -> token slots:
             # cat([arange(pid * page_size, (pid + 1) * page_size) for pid in page_ids])
-            token_offsets = torch.arange(self.page_size, dtype=torch.int64, device=page_ids.device)
-            slot_mapping = (page_ids.unsqueeze(1) * self.page_size + token_offsets.unsqueeze(0)).reshape(-1)
+            token_offsets = torch.arange(
+                self.page_size, dtype=torch.int64, device=page_ids.device
+            )
+            slot_mapping = (
+                page_ids.unsqueeze(1) * self.page_size + token_offsets.unsqueeze(0)
+            ).reshape(-1)
             mappings.append(slot_mapping)
         return mappings
 
@@ -297,9 +316,13 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             if lookup_results.host_cached_lengths[i].item() == 0:
                 continue
             # assert lookup_results.host_cached_start_indices[i].item() == 0
-        
+
             # Case 1: GPU cache is shorter
-            if lookup_result.host_cached_lengths[i].item() > lookup_result.gpu_cached_start_indices[i] + lookup_result.gpu_cached_lengths[i].item():
+            if (
+                lookup_result.host_cached_lengths[i].item()
+                > lookup_result.gpu_cached_start_indices[i]
+                + lookup_result.gpu_cached_lengths[i].item()
+            ):
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
@@ -317,7 +340,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 onboard_slot_mappings.append(index_meta.slot_mappings[i])
                 continue
 
-            # TODO(junyiq): Add optimization to onboard partial. For now on all cases, we onboard the full sequence. 
+            # TODO(junyiq): Add optimization to onboard partial. For now on all cases, we onboard the full sequence.
 
         if len(onboard_task_ids) == 0:
             return HostKVTaskHandle(
@@ -328,8 +351,8 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
 
         onload_handle = _FlexKVOnloadHandle(
             task_ids=onboard_task_ids,
-            uids = torch.tensor(onboard_uids, dtype=torch.int64),
-            slot_mappings = onboard_slot_mappings,
+            uids=torch.tensor(onboard_uids, dtype=torch.int64),
+            slot_mappings=onboard_slot_mappings,
         )
         onload_task_handle = HostKVTaskHandle(
             backend="flexkv",
@@ -337,11 +360,15 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             handle=onload_handle,
             status=HostKVTaskStatus.LAUNCHED,
             metadata={
-                "onboard_start_indices": torch.tensor(onboard_start_indices, dtype=torch.int32),
+                "onboard_start_indices": torch.tensor(
+                    onboard_start_indices, dtype=torch.int32
+                ),
                 "onboard_lengths": torch.tensor(onboard_lengths, dtype=torch.int32),
             },
         )
-        fail_close = str(self.host_kvstorage_fail_policy).strip().lower() == "fail_close"
+        fail_close = (
+            str(self.host_kvstorage_fail_policy).strip().lower() == "fail_close"
+        )
 
         try:
             self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
@@ -351,12 +378,16 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 backend="flexkv",
                 user_ids=index_meta.user_ids,
                 handle=onload_handle,
-                status=HostKVTaskStatus.FAILED if fail_close else HostKVTaskStatus.SKIPPED,
+                status=HostKVTaskStatus.FAILED
+                if fail_close
+                else HostKVTaskStatus.SKIPPED,
                 metadata={"error": f"onboard launch failed: {e}"},
             )
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
-        onboard_results : Dict[int, "KVResponse"] = self._client.wait(task_handle.handle.task_ids)
+        onboard_results: Dict[int, "KVResponse"] = self._client.wait(
+            task_handle.handle.task_ids
+        )
 
         failed_flag = list()
         failed_user_ids = list()
@@ -383,16 +414,15 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             return HostKVWaitResult(
                 status=HostKVTaskStatus.FAILED,
                 ready=False,
-                failed_mask = failed_flag,
-                failed_user_ids = failed_user_ids,
+                failed_mask=failed_flag,
+                failed_user_ids=failed_user_ids,
             )
-
 
     def offload_kvcache_launch(
         self,
-        offload_user_ids: torch.Tensor, 
-        offload_start_indices: torch.Tensor, 
-        offload_page_indices_list: List[torch.Tensor], 
+        offload_user_ids: torch.Tensor,
+        offload_start_indices: torch.Tensor,
+        offload_page_indices_list: List[torch.Tensor],
         index_meta: Optional[KVIndexMeta] = None,
         kvcache_metadata: Optional[KVCacheMetadata] = None,
     ) -> Optional[HostKVTaskHandle]:
@@ -400,8 +430,12 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         assert offload_user_ids == index_meta.user_ids
 
         slot_mappings = index_meta.slot_mappings
-        slot_mappings = slot_mappings if slot_mappings is not None else self._build_slot_mappings(kvcache_metadata)
-        
+        slot_mappings = (
+            slot_mappings
+            if slot_mappings is not None
+            else self._build_slot_mappings(kvcache_metadata)
+        )
+
         task_ids: List[int] = []
         for idx in range(offload_user_ids.size(0)):
             task_id = self._client.put_async(
@@ -414,11 +448,14 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,
-            handle=_FlexKVOffloadHandle(task_ids=task_ids, uids=index_meta.user_ids, seqlens=index_meta.sequence_lengths),
+            handle=_FlexKVOffloadHandle(
+                task_ids=task_ids,
+                uids=index_meta.user_ids,
+                seqlens=index_meta.sequence_lengths,
+            ),
             status=HostKVTaskStatus.LAUNCHED,
         )
 
-     
     def offload_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         task_ids = task_handle.handle.task_ids
         user_ids = task_handle.handle.uids
@@ -427,7 +464,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             user_ids=user_ids,
         )
         return wait_result
-    
+
     def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
         # FlexKV wait success equals finish
         # TODO(junyiq): Make sure gpu kvcache locks the pages when offloading for flexkv backend.
@@ -439,23 +476,25 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self._client.cancel(task_handle.handle.task_ids)
         task_handle.status = HostKVTaskStatus.CANCELLED
         return True
-    
+
     def evict(self, user_ids: torch.Tensor) -> None:
         warnings.warn(
             "FlexKV backend does not expose an explicit evict API; evict() is a no-op.",
             RuntimeWarning,
             stacklevel=2,
         )
-    
+
     def evict_all(self) -> None:
         warnings.warn(
             "FlexKV backend does not expose an explicit evict_all API; evict_all() is a no-op.",
             RuntimeWarning,
             stacklevel=2,
         )
-    
+
     @staticmethod
-    def get_offload_handle_metadata(task_handle) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_offload_handle_metadata(
+        task_handle,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             task_handle.handle.uids,
             torch.zeros_like(task_handle.handle.seqlens),
@@ -477,18 +516,22 @@ class FlexKVClientAdapter:
             assert seq_mask is None
 
             if len(seq_ids) == 0:
-                reqs.append({
-                    "user_id": int(index_meta.user_ids[i]),
-                    "namespace": [index_meta.namespaces[i]],
-                    "token_ids": np.zeros((0,), dtype=np.int64),
-                    "token_mask": np.zeros((0,), dtype=np.bool_),
-                })
+                reqs.append(
+                    {
+                        "user_id": int(index_meta.user_ids[i]),
+                        "namespace": [index_meta.namespaces[i]],
+                        "token_ids": np.zeros((0,), dtype=np.int64),
+                        "token_mask": np.zeros((0,), dtype=np.bool_),
+                    }
+                )
                 continue
 
-            reqs.append({
-                "user_id": int(index_meta.user_ids[i]),
-                "namespace": [index_meta.namespaces[i]],
-                "token_ids": seq_ids,
-                "token_mask": seq_mask,
-            })
+            reqs.append(
+                {
+                    "user_id": int(index_meta.user_ids[i]),
+                    "namespace": [index_meta.namespaces[i]],
+                    "token_ids": seq_ids,
+                    "token_mask": seq_mask,
+                }
+            )
         return reqs

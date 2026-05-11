@@ -1,17 +1,12 @@
-import math
-import os
-import time
-
-import numpy as np
-import torch
-from typing import Any, List, Dict, Optional, Tuple, Union
-from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
-from .kvcache_config import KVCacheConfig
-from .kvcache_utils import KVCacheOffloadMode, KVLookupResult, KVIndexMeta
+import torch
+
 from .kvcache_metadata import KVCacheMetadata
+from .kvcache_utils import KVIndexMeta, KVLookupResult
 
 
 class HostKVTaskStatus(Enum):
@@ -23,6 +18,7 @@ class HostKVTaskStatus(Enum):
     TIMEOUT = "timeout"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
 
 class HostKVStorageErrorCode(str, Enum):
     SDK_IMPORT_FAILED = "sdk_import_failed"
@@ -36,6 +32,7 @@ class HostKVStorageErrorCode(str, Enum):
     OFFLOAD_WAIT_FAILED = "offload_wait_failed"
     OFFLOAD_TIMEOUT = "offload_timeout"
     CANCEL_FAILED = "cancel_failed"
+
 
 @dataclass
 class HostKVTaskHandle:
@@ -51,6 +48,7 @@ class HostKVTaskHandle:
         if self.is_layerwise:
             self.handle.wait_layer(layer_idx)
 
+
 @dataclass
 class HostKVWaitResult:
     status: HostKVTaskStatus
@@ -59,15 +57,18 @@ class HostKVWaitResult:
     failed_mask: Optional[torch.Tensor] = None
     failed_user_ids: Optional[List[int]] = None
 
+
 class HostKVStorageManagerBase(ABC):
     @abstractmethod
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
         ...
-    
+
     @abstractmethod
-    def build_index_meta(self, user_ids: torch.Tensor, sequence_lengths: torch.Tensor) -> KVIndexMeta:
+    def build_index_meta(
+        self, user_ids: torch.Tensor, sequence_lengths: torch.Tensor
+    ) -> KVIndexMeta:
         ...
-    
+
     @abstractmethod
     def lookup_kvcache(self, index_meta: KVIndexMeta) -> KVLookupResult:
         ...
@@ -88,8 +89,8 @@ class HostKVStorageManagerBase(ABC):
     @abstractmethod
     def offload_kvcache_launch(
         self,
-        offload_user_ids: torch.Tensor, 
-        offload_start_indices: torch.Tensor, 
+        offload_user_ids: torch.Tensor,
+        offload_start_indices: torch.Tensor,
         offload_page_indices_list: List[torch.Tensor],
         index_meta: Optional[KVIndexMeta] = None,
         kvcache_metadata: Optional[KVCacheMetadata] = None,
@@ -99,7 +100,7 @@ class HostKVStorageManagerBase(ABC):
     @abstractmethod
     def offload_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         ...
-    
+
     @abstractmethod
     def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
         ...
@@ -107,7 +108,7 @@ class HostKVStorageManagerBase(ABC):
     @abstractmethod
     def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
         ...
-    
+
     @abstractmethod
     def evict(self, user_ids: torch.Tensor) -> None:
         ...
@@ -115,8 +116,10 @@ class HostKVStorageManagerBase(ABC):
     @abstractmethod
     def evict_all(self) -> None:
         ...
-    
+
     @staticmethod
-    def get_offload_handle_metadata(task_handle) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_offload_handle_metadata(
+        task_handle,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # return (offload_uids, offload_start_indices, offload_lengths)
         ...

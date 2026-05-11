@@ -81,7 +81,7 @@ class InferenceRankingGR(torch.nn.Module):
 
         self.sparse_module.load_checkpoint(checkpoint_dir, model_state_dict)
         self.dense_module.load_state_dict(model_state_dict, strict=False)
-    
+
     def strip_cached_tokens(self, batch, origin_num_cached):
         torch.cuda.nvtx.range_push("strip_cached_tokens")
 
@@ -133,7 +133,6 @@ class InferenceRankingGR(torch.nn.Module):
         torch.cuda.nvtx.range_pop()
         return batch
 
-
     def forward_with_kvcache(
         self,
         batch: HSTUBatch,
@@ -151,7 +150,9 @@ class InferenceRankingGR(torch.nn.Module):
             )
 
             # asynchronous kvdata onboard, overlapping with strip_cached and embedding lookup
-            self.dense_module.kvcache.onboard_launch(index_meta, lookup_res, kvcache_metadata)
+            self.dense_module.kvcache.onboard_launch(
+                index_meta, lookup_res, kvcache_metadata
+            )
 
             old_cached_lengths = lookup_res.cached_lengths
             striped_batch = self.strip_cached_tokens(

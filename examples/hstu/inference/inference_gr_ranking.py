@@ -32,9 +32,9 @@ from configs import (
     get_inference_hstu_config,
 )
 from modules.metrics import get_multi_event_metric_module
+from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
-from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
@@ -161,8 +161,8 @@ def get_inference_hstu_model(
         contextual_max_seqlen=num_contextual_features,
     )
 
-    host_capacity_per_layer = 10240 * 2 * 32 * (
-        network_args.num_attention_heads * network_args.kv_channels
+    host_capacity_per_layer = (
+        10240 * 2 * 32 * (network_args.num_attention_heads * network_args.kv_channels)
     )
     kvcache_args = {
         "num_layers": network_args.num_layers,
@@ -171,15 +171,15 @@ def get_inference_hstu_model(
         "page_size": 32,
         "offload_chunksize": 1024,
         "num_primary_cache_pages": 10240,
-        "num_buffer_pages":  0,
+        "num_buffer_pages": 0,
         "host_capacity_per_layer": host_capacity_per_layer,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
         "dtype": torch.bfloat16,
         "device": torch.cuda.current_device(),
         "host_kvstorage_backend": "native",
-        "offload_timeout_ms":  100.0,
-        "offload_mode":  "lazy",
+        "offload_timeout_ms": 100.0,
+        "offload_mode": "lazy",
     }
     kv_cache_config = get_kvcache_config(**kvcache_args)
 

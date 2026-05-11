@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from enum import Enum, unique
 from typing import List, Optional
 
 import torch
@@ -24,6 +23,7 @@ class KVCacheMetadata:
     """
     KVCacheMetadata is a  data class for the HSTU KV cache metadata of a batch.
     """
+
     page_ids_gpu_buffer: torch.Tensor
     metadata_gpu_buffer: torch.Tensor
 
@@ -55,7 +55,7 @@ class KVCacheMetadata:
 
 
 def get_kvcache_metadata_buffer(
-    batch_size: int, 
+    batch_size: int,
     num_new_tokens: int,
     num_pages: int,
     page_ids_gpu_buffer: Optional[torch.Tensor] = None,
@@ -64,41 +64,49 @@ def get_kvcache_metadata_buffer(
 ):
     if device is None:
         device = torch.cuda.current_device()
-        
-    page_ids_gpu_buffer = torch.empty(
-        (num_pages,),
-        dtype=torch.int32,
-        device=device,
-    ) if page_ids_gpu_buffer is None else page_ids_gpu_buffer
 
-    metadata_gpu_buffer = torch.empty(
-        (5 * batch_size + 4 + num_new_tokens * 2,),
-        dtype=torch.int32,
-        device=device,
-    ) if metadata_gpu_buffer is None else metadata_gpu_buffer
+    page_ids_gpu_buffer = (
+        torch.empty(
+            (num_pages,),
+            dtype=torch.int32,
+            device=device,
+        )
+        if page_ids_gpu_buffer is None
+        else page_ids_gpu_buffer
+    )
 
+    metadata_gpu_buffer = (
+        torch.empty(
+            (5 * batch_size + 4 + num_new_tokens * 2,),
+            dtype=torch.int32,
+            device=device,
+        )
+        if metadata_gpu_buffer is None
+        else metadata_gpu_buffer
+    )
 
-    page_indptr_buffer = metadata_gpu_buffer.narrow(0, 
-        0, batch_size + 1)
-    last_page_lens_buffer = metadata_gpu_buffer.narrow(0, 
-        batch_size + 1, batch_size)
-    total_history_lengths = metadata_gpu_buffer.narrow(0, 
-        batch_size * 2 + 1, batch_size)
-    total_history_offsets = metadata_gpu_buffer.narrow(0, 
-        batch_size * 3 + 1, batch_size + 1)
-    new_history_nnz_cuda = metadata_gpu_buffer.narrow(0, 
-        batch_size * 4 + 2, 1)
-    new_history_offsets = metadata_gpu_buffer.narrow(0, 
-        batch_size * 4 + 3, batch_size + 1)
-    batch_indices_buffer = metadata_gpu_buffer.narrow(0, 
-        batch_size * 5 + 4, num_new_tokens)
-    position_buffer = metadata_gpu_buffer.narrow(0, 
-        batch_size * 5 + 4 + num_new_tokens, num_new_tokens)
+    page_indptr_buffer = metadata_gpu_buffer.narrow(0, 0, batch_size + 1)
+    last_page_lens_buffer = metadata_gpu_buffer.narrow(0, batch_size + 1, batch_size)
+    total_history_lengths = metadata_gpu_buffer.narrow(
+        0, batch_size * 2 + 1, batch_size
+    )
+    total_history_offsets = metadata_gpu_buffer.narrow(
+        0, batch_size * 3 + 1, batch_size + 1
+    )
+    new_history_nnz_cuda = metadata_gpu_buffer.narrow(0, batch_size * 4 + 2, 1)
+    new_history_offsets = metadata_gpu_buffer.narrow(
+        0, batch_size * 4 + 3, batch_size + 1
+    )
+    batch_indices_buffer = metadata_gpu_buffer.narrow(
+        0, batch_size * 5 + 4, num_new_tokens
+    )
+    position_buffer = metadata_gpu_buffer.narrow(
+        0, batch_size * 5 + 4 + num_new_tokens, num_new_tokens
+    )
 
     return KVCacheMetadata(
         page_ids_gpu_buffer=page_ids_gpu_buffer,
         metadata_gpu_buffer=metadata_gpu_buffer,
-
         kv_indices=page_ids_gpu_buffer,
         kv_indptr=page_indptr_buffer,
         kv_last_page_len=last_page_lens_buffer,
@@ -109,7 +117,6 @@ def get_kvcache_metadata_buffer(
         position=position_buffer,
         new_history_nnz=num_new_tokens,
         new_history_nnz_cuda=new_history_nnz_cuda,
-
         kv_onload_handle=None,
     )
 

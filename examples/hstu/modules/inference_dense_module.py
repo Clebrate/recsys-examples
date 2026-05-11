@@ -12,9 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import paged_kvcache_ops
 import torch
@@ -23,18 +22,14 @@ from commons.ops.triton_ops.common import (
     set_static_max_seq_lens,
     set_use_runtime_max_seq_len,
 )
-from configs import (
-    HSTUConfig,
-    InferenceHSTUConfig,
-    RankingConfig,
-)
+from configs import HSTUConfig, InferenceHSTUConfig, RankingConfig
 from modules.hstu_block_inference import HSTUBlockInference
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_metadata import (
+    KVCacheMetadata,
     copy_kvcache_metadata,
     get_kvcache_metadata_buffer,
-    KVCacheMetadata
 )
 from recsys_kvcache_manager.kvcache_utils import KVIndexMeta, KVLookupResult
 
@@ -48,7 +43,6 @@ else:
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from torchrec.sparse.jagged_tensor import JaggedTensor
-
 
 
 def get_jagged_metadata_buffer(max_batch_size, max_seq_len, contextual_max_seqlen):
@@ -233,7 +227,8 @@ class InferenceDenseModule(torch.nn.Module):
                     hstu_config, kvcache_config
                 )
                 self._kvcache_metadata.kv_cache_table = (
-                    self.kvcache.gpu_kvcache_mgr.gpu_kvcache_table[idx] for idx in range(self.num_layers)
+                    self.kvcache.gpu_kvcache_mgr.gpu_kvcache_table[idx]
+                    for idx in range(self.num_layers)
                 )
                 self._kvcache_metadata.kv_onload_handle = (
                     paged_kvcache_ops.KVOnloadHandle(self.num_layers)
@@ -348,8 +343,13 @@ class InferenceDenseModule(torch.nn.Module):
             jagged_data.scaling_seqlen = self._scaling_seqlen
 
             # The seqlen for attention kv data loading (from both kvcache [history] and direct input [canididates]).
-            kvcache_metadata.kv_seqlen_offsets = kvcache_metadata.total_history_offsets + jagged_data.num_candidates_offsets
-            kvcache_metadata.kv_seqlens = kvcache_metadata.total_history_lengths + jagged_data.num_candidates
+            kvcache_metadata.kv_seqlen_offsets = (
+                kvcache_metadata.total_history_offsets
+                + jagged_data.num_candidates_offsets
+            )
+            kvcache_metadata.kv_seqlens = (
+                kvcache_metadata.total_history_lengths + jagged_data.num_candidates
+            )
             kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
 
             num_tokens = batch.features.values().shape[0]
