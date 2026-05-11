@@ -109,6 +109,8 @@ def get_kvcache_metadata_buffer(
         position=position_buffer,
         new_history_nnz=num_new_tokens,
         new_history_nnz_cuda=new_history_nnz_cuda,
+
+        kv_onload_handle=None,
     )
 
 

@@ -16,19 +16,19 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from enum import Enum
 
-from .hierarchical_kvcache_manager import (
-    SecondaryKVCacheManagerBase,
-    SecondaryErrorCode,
-    SecondaryTaskStatus,
-    SecondaryTaskHandle,
-    SecondaryWaitResult,
+from .host_kvstorage_manager import (
+    HostKVStorageManagerBase,
+    HostKVStorageErrorCode,
+    HostKVTaskStatus,
+    HostKVTaskHandle,
+    HostKVWaitResult,
 )
 
 from .kvcache_config import KVCacheConfig
 from .kvcache_utils import KVCacheOffloadMode, KVLookupResult, KVIndexMeta
 from .kvcache_metadata import KVCacheMetadata
 
-class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
+class NativeHostKVCacheManager(HostKVStorageManagerBase):
     def __init__(self,
         num_layers: int,
         num_heads: int,
@@ -38,10 +38,10 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         bytes_capacity_per_layer: int,
         max_batch_size: int,
         max_sequence_length: int,
-        onload_timeout_ms: float,
-        offload_timeout_ms: float,
-        dtype: torch.dtype,
-        device_idx: int,
+        onload_timeout_ms: float = 0.0,
+        offload_timeout_ms: float = 0.0,
+        dtype: torch.dtype = torch.bfloat16,
+        device_idx: int = 0,
     ):
         self.backend_name = "native"
 
@@ -56,7 +56,7 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         self.dtype = dtype
         self.device_idx = device_idx
 
-        self.kvcache_mananger_impl = HostKVStorageImpl(
+        self.impl_ = HostKVStorageImpl(
             self.num_layers,
             self.num_heads, 
             self.head_dim,
@@ -71,10 +71,8 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         self._onload_timeout_ms = onload_timeout_ms
         self._offload_timeout_ms = offload_timeout_ms
     
-    def register_gpu_cache_table(self, cache_table: torch.Tensor):
-        self.kvcache_mananger_impl.register_gpu_cache_table(
-            [ cache_table[idx] for idx in range(self.num_layers) ]
-        )
+    def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]):
+        self.impl_.register_gpu_cache_table(cache_table_list)
     
     def build_index_meta(self, user_ids: torch.Tensor, sequence_lengths: torch.Tensor) -> KVIndexMeta:
         index_meta = KVIndexMeta(
@@ -84,7 +82,7 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         return index_meta
 
     def lookup_kvcache(self, index_meta: KVIndexMeta) -> KVLookupResult:
-        cached_lengths = self.kvcache_mananger_impl.lookup(index_meta.user_ids)
+        cached_lengths = self.impl_.lookup(index_meta.user_ids)
         cached_start_indices = torch.zeros_like(cached_lengths)
         return KVLookupResult(
             user_ids=index_meta.user_ids,
@@ -92,11 +90,11 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
             host_cached_lengths=cached_lengths,
         )
 
-    def onboard_launch_kvcache(self,
+    def onboard_kvcache_launch(self,
         index_meta: KVIndexMeta,
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata
-    ) -> SecondaryTaskHandle:
+    ) -> HostKVTaskHandle:
         g_end_idxs = lookup_result.gpu_cached_start_indices + lookup_result.gpu_cached_lengths
         h_longer = g_end_idxs < lookup_result.host_cached_lengths
 
@@ -121,51 +119,52 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         ]
         if torch.sum(onload_lengths).item() == 0:
             # No data to onboard, skip the task.
-            return SecondaryTaskHandle(
+            return HostKVTaskHandle(
                 backend="native",
                 handle=None,
-                status=SecondaryTaskStatus.SKIPPED,
+                status=HostKVTaskStatus.SKIPPED,
             )
 
         native_handle = KVOnloadHandle(self.num_layers)
-        self.kvcache_mananger_impl.onload_kvcache(
+        self.impl_.onload_kvcache(
             index_meta.user_ids,
             onload_paged_ids_list,
             native_handle)
-        return SecondaryTaskHandle(
+        return HostKVTaskHandle(
             backend="native",
             handle=native_handle,
-            status=SecondaryTaskStatus.LAUNCHED,
+            status=HostKVTaskStatus.LAUNCHED,
+            is_layerwise=True,
             metadata={
                 "onboard_start_indices": onload_start_indices,
                 "onboard_lengths": onload_lengths,
             },
         )
 
-    def onboard_wait_kvcache(self, task_handle):
+    def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         # Use layerwise data transfer and sync for native backend.
-        return SecondaryWaitResult(
-            status=SecondaryTaskStatus.SKIPPED,
+        return HostKVWaitResult(
+            status=HostKVTaskStatus.SKIPPED,
             ready=False,
         )
     
-    def onboard_wait_kvcache_by_layer(self, task_handle, layer_idx: int):  # wait for a single layer
-        task_handle.handle.wait_host(layer_idx)
-        return SecondaryWaitResult(
-            status=SecondaryTaskStatus.EVENT_READY,  # the following get on the default stream will be synced
+    def onboard_kvcache_wait_by_layer(self, task_handle, layer_idx: int):  # wait for a single layer
+        task_handle.stream_wait_layer(layer_idx)
+        return HostKVWaitResult(
+            status=HostKVTaskStatus.EVENT_READY,  # the following get on the default stream will be synced
             ready=True,
         )
 
-    def offload_launch_kvcache(
+    def offload_kvcache_launch(
         self,
         offload_user_ids: torch.Tensor, 
         offload_start_indices: torch.Tensor, 
         offload_page_indices_list: List[torch.Tensor], 
         index_meta: Optional[KVIndexMeta] = None,
         kvcache_metadata: Optional[KVCacheMetadata] = None,
-    ):
+    ) -> Optional[HostKVTaskHandle]:
         native_handle = KVOffloadHandle(self.num_layers)
-        ret = self.kvcache_mananger_impl.offload_kvcache(
+        ret = self.impl_.offload_kvcache(
             offload_user_ids, 
             offload_start_indices, 
             offload_page_indices_list, 
@@ -173,51 +172,51 @@ class NativeHostKVCacheManager(SecondaryKVCacheManagerBase):
         if not ret:
             return None
 
-        return SecondaryTaskHandle(
+        return HostKVTaskHandle(
             backend="native",
             handle=native_handle,
-            status=SecondaryTaskStatus.LAUNCHED,
+            status=HostKVTaskStatus.LAUNCHED,
             time_launched=time.perf_counter_ns(),
         )
 
-    def offload_wait_kvcache(self, task_handle):
-        is_ready = task_handle.handle.try_wait_host(-1)
+    def offload_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
+        is_ready = task_handle.handle.try_wait_layer(-1)
         elapsed_time = (time.perf_counter_ns() - task_handle.time_launched) / 1000_000.
         # print(f"[DEBUG] Offload elapsed time: {elapsed_time} ms")
-        return SecondaryWaitResult(
-            status=SecondaryTaskStatus.READY if is_ready else 
-                   SecondaryTaskStatus.TIMEOUT if elapsed_time > self._offload_timeout_ms else 
-                   SecondaryTaskStatus.LAUNCHED,
+        return HostKVWaitResult(
+            status=HostKVTaskStatus.READY if is_ready else 
+                   HostKVTaskStatus.TIMEOUT if (self._offload_timeout_ms > 0 and elapsed_time > self._offload_timeout_ms) else 
+                   HostKVTaskStatus.LAUNCHED,
             ready=is_ready,
         )
     
-    def finish_task(self, task_handle):
+    def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
         if isinstance(task_handle.handle, KVOnloadHandle):
             raise NotImplementedError("Finish onload by layer is supported, but not the whole task at once, since the native implementation uses layerwise synchronization.")
         elif isinstance(task_handle.handle, KVOffloadHandle):
-            return self.kvcache_mananger_impl.finish_offload(task_handle.handle)
+            return self.impl_.finish_offload(task_handle.handle)
         else:
             raise ValueError(f"Unknown task handle type: {type(task_handle.handle)}")
         return False
 
-    def cancel_task(self, task_handle):
+    def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
         if isinstance(task_handle.handle, KVOnloadHandle):
             raise NotImplementedError("Cancel onload is not supported in the current native implementation.")
         elif isinstance(task_handle.handle, KVOffloadHandle):
-            return self.kvcache_mananger_impl.cancel_offload(task_handle.handle)
+            return self.impl_.cancel_offload(task_handle.handle)
         else:
             raise ValueError(f"Unknown task handle type: {type(task_handle.handle)}")
         return False
     
-    def evict(self, user_ids: torch.Tensor):
+    def evict(self, user_ids: torch.Tensor) -> None:
         for uid in user_ids.tolist():
-            self.kvcache_mananger_impl.evict(uid)
+            self.impl_.evict(uid)
     
-    def evict_all(self,):
-        self.kvcache_mananger_impl.evict_all()
+    def evict_all(self) -> None:
+        self.impl_.evict_all()
     
     @staticmethod
-    def get_offload_handle_metadata(task_handle):
+    def get_offload_handle_metadata(task_handle) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             task_handle.handle.get_user_ids(),
             task_handle.handle.get_start_indices(),

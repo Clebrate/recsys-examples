@@ -5,11 +5,14 @@ from typing import Any, Dict, Optional
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
-from configs import InferenceHSTUConfig, KVCacheConfig
+from configs import InferenceHSTUConfig
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from torchrec.sparse.jagged_tensor import JaggedTensor
+from recsys_kvcache_manager.kvcache_metadata import (
+    copy_kvcache_metadata,
+)
 
 
 class HSTUBlockInference(torch.nn.Module):
@@ -23,7 +26,6 @@ class HSTUBlockInference(torch.nn.Module):
     def __init__(
         self,
         config: InferenceHSTUConfig,
-        kvcache_config: KVCacheConfig,
     ):
         super().__init__()
         self.config = config
@@ -33,7 +35,7 @@ class HSTUBlockInference(torch.nn.Module):
 
         self._attention_layers = torch.nn.ModuleList(
             [
-                PagedHSTUInferLayer(config, kvcache_config, layer_idx)
+                PagedHSTUInferLayer(config, layer_idx)
                 for layer_idx in range(self.config.num_layers)
             ]
         )
@@ -158,8 +160,7 @@ class HSTUBlockInference(torch.nn.Module):
             self._hstu_graph[batch_size][num_tokens_padded][0].replay()  # type: ignore
             for idx in range(1, self.config.num_layers + 1):
                 if kv_cache_metadata is not None:
-                    kv_cache_metadata.kv_onload_handle.wait_host(idx - 1)
-                    kv_cache_metadata.kv_offload_handle.mark_ready(idx - 1)
+                    kv_cache_metadata.kv_onload_handle.stream_wait_layer(idx - 1)
                 self._hstu_graph[batch_size][num_tokens_padded][idx].replay()  # type: ignore
 
             hstu_output = torch.zeros_like(hidden_states[:num_tokens, ...])

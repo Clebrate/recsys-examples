@@ -52,12 +52,12 @@ class KVCacheConfig:
     dtype: torch.dtype
     device: int
 
-    secondary_backend: str = "nop"
+    host_kvstorage_backend: str = "nop"
 
     onload_timeout_ms: float = 0.0
-    offload_mode: str = "lazy"
     offload_timeout_ms: float = 1000.0
-    # secondary_fail_policy: str = "fail_open"
+    offload_mode: str = "lazy"
+    # host_kvstorage_fail_policy: str = "fail_open"
 
     extra_configs: Dict[str, Any] = field(default_factory=dict)
 
@@ -75,10 +75,11 @@ def get_kvcache_config(
     max_seq_len: int,
     dtype: torch.dtype,
     device: int,
-    secondary_backend: str = "nop",
+    host_kvstorage_backend: str = "nop",
+    onload_timeout_ms: float = 0.0,
+    offload_timeout_ms: float = 0.0,
     offload_mode: str = "lazy",
-    offload_timeout_ms: float = 1000.0,
-    # secondary_fail_policy: str = "fail_open",
+    # host_kvstorage_fail_policy: str = "fail_open",
     extra_configs: Optional[Dict[str, Any]] = None,
 ) -> KVCacheConfig:
     """
@@ -105,11 +106,12 @@ def get_kvcache_config(
         host_capacity_per_layer=host_capacity_per_layer,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
-        secondary_backend=secondary_backend,
-        offload_mode=offload_mode,
-        offload_timeout_ms=offload_timeout_ms,
         dtype=dtype,
         device=device,
-        # secondary_fail_policy=secondary_fail_policy,
+        host_kvstorage_backend=host_kvstorage_backend,
+        onload_timeout_ms=onload_timeout_ms,
+        offload_timeout_ms=offload_timeout_ms,
+        offload_mode=offload_mode,
+        # host_kvstorage_fail_policy=host_kvstorage_fail_policy,
         extra_configs=dict(extra_configs or {}),
     )

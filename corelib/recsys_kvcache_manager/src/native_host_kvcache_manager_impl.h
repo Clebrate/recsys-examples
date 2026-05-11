@@ -49,7 +49,7 @@ public:
     void init();
     void reset();
     void complete_host(int layer_idx, cudaStream_t stream);
-    void wait_host(int layer_idx);
+    void wait_layer(int layer_idx);
 
 public:
     int num_layers;
@@ -76,7 +76,7 @@ public:
     void complete_host(int layer_idx, cudaStream_t stream);
     void complete_host(int layer_idx, cudaStream_t stream, 
                        std::vector<std::pair< std::vector<int64_t>, std::vector<int64_t> >>&& chunks);
-    bool try_wait_host(int layer_idx);
+    bool try_wait_layer(int layer_idx);
     float get_launch_time(void) { return this->time_stamp; }
     void set_launch_time(float time) { this->time_stamp = time; }
 public:

@@ -49,13 +49,13 @@ PYBIND11_MODULE(kvcache_cpp, m) {
   py::class_<kvcache::KVOnloadHandle>(m, "KVOnloadHandle", py::module_local())
     .def(py::init<int>(), py::arg("num_layers"))
     // .def("reset", &kvcache::KVOnloadHandle::reset)
-    .def("wait_host", &kvcache::KVOnloadHandle::wait_host)
+    .def("wait_layer", &kvcache::KVOnloadHandle::wait_layer)
   ;
 
   py::class_<kvcache::KVOffloadHandle>(m, "KVOffloadHandle", py::module_local())
     .def(py::init<int>(), py::arg("num_layers"))
     // .def("reset", &kvcache::KVOffloadHandle::reset)
-    .def("try_wait_host", &kvcache::KVOffloadHandle::try_wait_host)
+    .def("try_wait_layer", &kvcache::KVOffloadHandle::try_wait_layer)
     .def("get_user_ids", &kvcache::KVOffloadHandle::get_user_ids)
     .def("get_start_indices", &kvcache::KVOffloadHandle::get_start_indices)
     .def("get_lengths", &kvcache::KVOffloadHandle::get_lengths)

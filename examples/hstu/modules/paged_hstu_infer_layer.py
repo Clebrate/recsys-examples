@@ -15,7 +15,7 @@
 import paged_kvcache_ops
 import torch
 import torch.nn.functional as F
-from configs import InferenceHSTUConfig, KVCacheConfig
+from configs import InferenceHSTUConfig
 from hstu import hstu_attn_varlen_func
 from modules.jagged_data import JaggedData
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
@@ -40,7 +40,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
     def __init__(
         self,
         config: InferenceHSTUConfig,
-        kv_cache_config: KVCacheConfig,
         layer_idx: int,
     ):
         super().__init__()
@@ -303,8 +302,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 self.num_sms,
             )
 
-            kv_cache_metadata.kv_onload_handle.wait_host(self.layer_idx)
-            kv_cache_metadata.kv_offload_handle.mark_ready(self.layer_idx)
+            kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
             jagged_attn_output = hstu_attn_varlen_func(
                 query,
                 key,
@@ -438,7 +436,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             key,
             value,
             jd.seqlen_offsets[: batch_size + 1],
-            kv_cache_metadata.total_history_offsets[: batch_size + 1]
+            kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1]
             if use_kvcache
             else jd.seqlen_offsets[: batch_size + 1],
             None,

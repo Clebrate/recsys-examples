@@ -107,7 +107,7 @@ void KVOnloadHandle::complete_host(int layer_idx, cudaStream_t stream) {
     cv_.notify_one();
 };
 
-void KVOnloadHandle::wait_host(int layer_idx) {
+void KVOnloadHandle::wait_layer(int layer_idx) {
     if (no_onload) return;
     {
         std::unique_lock<std::mutex> lock(mtx_);
@@ -172,7 +172,7 @@ void KVOffloadHandle::complete_host(int layer_idx, cudaStream_t stream,
     this->host_ready[layer_idx].store(1, std::memory_order_release);
 }
 
-bool KVOffloadHandle::try_wait_host(int layer_idx) {
+bool KVOffloadHandle::try_wait_layer(int layer_idx) {
     if (layer_idx == -1) layer_idx = this->host_ready.size() - 1;
     if (this->host_ready[layer_idx].load(std::memory_order_acquire) == 0) {
         return false;

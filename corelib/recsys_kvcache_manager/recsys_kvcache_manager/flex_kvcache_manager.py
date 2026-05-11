@@ -12,12 +12,12 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from enum import Enum
 
-from .hierarchical_kvcache_manager import (
-    SecondaryKVCacheManagerBase,
-    SecondaryTaskHandle,
-    SecondaryTaskStatus,
-    SecondaryWaitResult,
-    SecondaryErrorCode,
+from .host_kvstorage_manager import (
+    HostKVStorageManagerBase,
+    HostKVTaskHandle,
+    HostKVTaskStatus,
+    HostKVWaitResult,
+    HostKVStorageErrorCode,
 )
 from .kvcache_utils import FlexKVIndexMeta, KVIndexMeta, KVLookupResult
 from uuid import uuid4
@@ -36,8 +36,9 @@ class _FlexKVOnloadHandle:
 class _FlexKVOffloadHandle:
     task_ids: List[int]
     uids: torch.Tensor
+    seqlens: torch.Tensor
 
-class FlexKVStorageManager(SecondaryKVCacheManagerBase):
+class FlexKVStorageManager(HostKVStorageManagerBase):
     def __init__(
         self,
         mode: str = "direct",
@@ -51,8 +52,8 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         num_local_blocks: int = 4096,
         num_tmp_cpu_blocks: int = 256,
         enable_mps: bool = False,
-        secondary_wait_timeout_ms: int = 0,
-        secondary_fail_policy: str = "fail_open",
+        hostkv_wait_timeout_ms: int = 0,
+        host_kvstorage_fail_policy: str = "fail_open",
     ) -> None:
         self.mode = mode
         self.server_addr = server_addr
@@ -64,8 +65,8 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         self.num_cpu_blocks = int(num_cpu_blocks)
         self.num_local_blocks = int(num_local_blocks)
         self.num_tmp_cpu_blocks = int(num_tmp_cpu_blocks)
-        self.secondary_wait_timeout_ms = int(secondary_wait_timeout_ms)
-        self.secondary_fail_policy = secondary_fail_policy
+        self.hostkv_wait_timeout_ms = int(hostkv_wait_timeout_ms)
+        self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.enable_mps = bool(enable_mps)
 
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
@@ -79,9 +80,8 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         self._client = None
         self._ready = False
 
-    def register_gpu_cache_table(self, cache_table: torch.Tensor) -> None:
-        assert cache_table.size(0) == self.num_layers, f"cache_table first dimension {cache_table.size(0)} does not match num_layers {self.num_layers}"
-        cache_table_list = [ cache_table[idx] for idx in range(self.num_layers) ]
+    def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
+        assert len(cache_table_list) == self.num_layers, f"cache_table_list length {len(cache_table_list)} does not match num_layers {self.num_layers}"
 
         # Use fake view (2, #block, blocksize, #head, headdim) for flexKV registration.
         # Actual data will be organized in the original GPU cache tensors shape (#block, 2, blocksize, #head, headdim).
@@ -152,13 +152,13 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         )
         self._client.start()
     
-    # - Applies timeout when secondary_wait_timeout_ms > 0.
-    # - Maps FlexKV wait responses into SecondaryTaskStatus.
+    # - Applies timeout when hostkv_wait_timeout_ms > 0.
+    # - Maps FlexKV wait responses into HostKVTaskStatus.
     def _try_wait_offload_and_map_result(
         self,
         task_ids: List[int],
         user_ids: List[int],
-    ) -> SecondaryWaitResult:
+    ) -> HostKVWaitResult:
 
         responses = self._client.try_wait(task_ids)
 
@@ -180,27 +180,27 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             else:
                 has_failed = True
         # if has_timeout:
-        #     return SecondaryWaitResult(
-        #         status=SecondaryTaskStatus.TIMEOUT,
+        #     return HostKVWaitResult(
+        #         status=HostKVTaskStatus.TIMEOUT,
         #         ready=False,
         #         message=";".join(msgs),
         #         failed_user_ids=user_ids,
         #     )
         if has_failed or has_cancelled:
-            return SecondaryWaitResult(
-                status=SecondaryTaskStatus.CANCELLED if has_cancelled and not has_failed else SecondaryTaskStatus.FAILED,
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.CANCELLED if has_cancelled and not has_failed else HostKVTaskStatus.FAILED,
                 ready=False,
                 message=";".join(msgs),
                 failed_user_ids=user_ids,
             )
         if has_unready:
-            return SecondaryWaitResult(
-                status=SecondaryTaskStatus.LAUNCHED,
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.LAUNCHED,
                 ready=False,
                 message=";".join(msgs),
                 failed_user_ids=user_ids,
             )
-        return SecondaryWaitResult(status=SecondaryTaskStatus.READY, ready=True)
+        return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
 
     def build_index_meta(
         self,
@@ -278,12 +278,12 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             mappings.append(slot_mapping)
         return mappings
 
-    def onboard_launch_kvcache(
+    def onboard_kvcache_launch(
         self,
         index_meta: KVIndexMeta,
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata,
-    ) -> SecondaryTaskHandle:
+    ) -> HostKVTaskHandle:
         # Save slot_mappings for Offload
         index_meta.slot_mappings = self._build_slot_mappings(kvcache_metadata)
 
@@ -320,10 +320,10 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             # TODO(junyiq): Add optimization to onboard partial. For now on all cases, we onboard the full sequence. 
 
         if len(onboard_task_ids) == 0:
-            return SecondaryTaskHandle(
+            return HostKVTaskHandle(
                 backend="flexkv",
                 handle=None,
-                status=SecondaryTaskStatus.SKIPPED,
+                status=HostKVTaskStatus.SKIPPED,
             )
 
         onload_handle = _FlexKVOnloadHandle(
@@ -331,31 +331,31 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
             uids = torch.tensor(onboard_uids, dtype=torch.int64),
             slot_mappings = onboard_slot_mappings,
         )
-        onload_task_handle = SecondaryTaskHandle(
+        onload_task_handle = HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,
             handle=onload_handle,
-            status=SecondaryTaskStatus.LAUNCHED,
+            status=HostKVTaskStatus.LAUNCHED,
             metadata={
                 "onboard_start_indices": torch.tensor(onboard_start_indices, dtype=torch.int32),
                 "onboard_lengths": torch.tensor(onboard_lengths, dtype=torch.int32),
             },
         )
-        fail_close = str(self.secondary_fail_policy).strip().lower() == "fail_close"
+        fail_close = str(self.host_kvstorage_fail_policy).strip().lower() == "fail_close"
 
         try:
             self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
             return onload_task_handle
         except Exception as e:
-            return SecondaryTaskHandle(
+            return HostKVTaskHandle(
                 backend="flexkv",
                 user_ids=index_meta.user_ids,
                 handle=onload_handle,
-                status=SecondaryTaskStatus.FAILED if fail_close else SecondaryTaskStatus.SKIPPED,
+                status=HostKVTaskStatus.FAILED if fail_close else HostKVTaskStatus.SKIPPED,
                 metadata={"error": f"onboard launch failed: {e}"},
             )
 
-    def onboard_wait_kvcache(self, task_handle: SecondaryTaskHandle) -> SecondaryWaitResult:
+    def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         onboard_results : Dict[int, "KVResponse"] = self._client.wait(task_handle.handle.task_ids)
 
         failed_flag = list()
@@ -375,27 +375,27 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 failed_user_ids.append(task_handle.user_ids[idx].item())
 
         if len(failed_user_ids) == 0:
-            return SecondaryWaitResult(
-                status=SecondaryTaskStatus.SUCCESS if ready else SecondaryTaskStatus.LAUNCHED,
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.SUCCESS if ready else HostKVTaskStatus.LAUNCHED,
                 ready=ready,
             )
         else:
-            return SecondaryWaitResult(
-                status=SecondaryTaskStatus.FAILED,
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.FAILED,
                 ready=False,
                 failed_mask = failed_flag,
                 failed_user_ids = failed_user_ids,
             )
 
 
-    def offload_launch_kvcache(
+    def offload_kvcache_launch(
         self,
         offload_user_ids: torch.Tensor, 
         offload_start_indices: torch.Tensor, 
         offload_page_indices_list: List[torch.Tensor], 
         index_meta: Optional[KVIndexMeta] = None,
         kvcache_metadata: Optional[KVCacheMetadata] = None,
-    ) -> SecondaryTaskHandle:
+    ) -> Optional[HostKVTaskHandle]:
         assert index_meta is not None
         assert offload_user_ids == index_meta.user_ids
 
@@ -411,14 +411,15 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
                 namespace=index_meta.namespaces[idx],
             )
             task_ids.append(int(task_id))
-        return SecondaryTaskHandle(
+        return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,
-            handle=_FlexKVOffloadHandle(task_ids=task_ids, uids=index_meta.user_ids),
-            status=SecondaryTaskStatus.LAUNCHED,
+            handle=_FlexKVOffloadHandle(task_ids=task_ids, uids=index_meta.user_ids, seqlens=index_meta.sequence_lengths),
+            status=HostKVTaskStatus.LAUNCHED,
         )
+
      
-    def offload_wait_kvcache(self, task_handle: SecondaryTaskHandle) -> SecondaryWaitResult:
+    def offload_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         task_ids = task_handle.handle.task_ids
         user_ids = task_handle.handle.uids
         wait_result = self._try_wait_offload_and_map_result(
@@ -427,32 +428,39 @@ class FlexKVStorageManager(SecondaryKVCacheManagerBase):
         )
         return wait_result
     
-    def finish_task(self, task_handle: SecondaryTaskHandle) -> bool:
+    def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
         # FlexKV wait success equals finish
         # TODO(junyiq): Make sure gpu kvcache locks the pages when offloading for flexkv backend.
         return True
 
-    def cancel_task(self, task_handle: SecondaryTaskHandle) -> None:
+    def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
         if task_handle is None or task_handle.handle is None:
-            return
+            return False
         self._client.cancel(task_handle.handle.task_ids)
-        task_handle.status = SecondaryTaskStatus.CANCELLED
+        task_handle.status = HostKVTaskStatus.CANCELLED
+        return True
     
-    def evict(self, user_ids: torch.Tensor):
+    def evict(self, user_ids: torch.Tensor) -> None:
         warnings.warn(
             "FlexKV backend does not expose an explicit evict API; evict() is a no-op.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return None
     
-    def evict_all(self):
+    def evict_all(self) -> None:
         warnings.warn(
             "FlexKV backend does not expose an explicit evict_all API; evict_all() is a no-op.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return None
+    
+    @staticmethod
+    def get_offload_handle_metadata(task_handle) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            task_handle.handle.uids,
+            torch.zeros_like(task_handle.handle.seqlens),
+            task_handle.handle.seqlens,
+        )
 
 
 class FlexKVClientAdapter:
