@@ -3,7 +3,6 @@ import os
 import time
 
 from kvcache_cpp import GPUKVCacheManagerImpl
-import paged_kvcache_ops
 
 import numpy as np
 import torch
@@ -109,11 +108,10 @@ class GPUKVCacheManager:
     def evict_all(self) -> None:
         self.kvcache_manager_impl.evict_all()
     
-    # def invalid(self, uids) -> None:
-    #     for uid in uids.tolist():
-    #         self.kvcache_manager_impl.invalid(uid)
-    
+    # debug use interface. Use `paged_kvcache_ops.append_kvcache` directly.
     def put(self, k, v, layer_idx, kvcache_metadata: KVCacheMetadata, append_offsets: Optional[torch.Tensor] = None) -> None:
+        import paged_kvcache_ops
+
         assert k.shape == v.shape, f"key and value shape mismatch: {k.shape} vs {v.shape}"
         if k.size(0) == self.num_layers:
             raise NotImplementedError("Only support layer-wise in this implementation.")
@@ -135,6 +133,7 @@ class GPUKVCacheManager:
             0,  # NHD layout
             self.num_sms)
     
+    # debug use interface
     def get(self, page_ids, last_page_lens, layer_idx) -> Tuple[torch.Tensor, torch.Tensor]:
         # Note: debug interface (for symmetry). Not used in inference pipeline.
         (paged_k_cache, paged_v_cache) = self.gpu_kvcache_table[layer_idx].unbind(dim=1)
