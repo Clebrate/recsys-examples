@@ -1,0 +1,378 @@
+diff --git a/flexkv/transfer/worker.py b/flexkv/transfer/worker.py
+index edcd83d..6663245 100644
+--- a/flexkv/transfer/worker.py
++++ b/flexkv/transfer/worker.py
+@@ -153,6 +153,74 @@ class TransferWorkerBase(ABC):
+             layer_ptrs[lay_id] = layer_blocks[lay_id][0].data_ptr()
+         return layer_ptrs
+ 
++    @staticmethod
++    def _find_dim_by_size(
++        shape: torch.Size,
++        target: int,
++        exclude: Optional[set[int]] = None,
++    ) -> Optional[int]:
++        if exclude is None:
++            exclude = set()
++        for idx, size in enumerate(shape):
++            if idx in exclude:
++                continue
++            if int(size) == int(target):
++                return idx
++        return None
++
++    def _resolve_gpu_runtime_strides_in_bytes(
++        self,
++        sample_tensor: torch.Tensor,
++        gpu_kv_layout: KVCacheLayout,
++        gpu_block_type: int,
++        dtype: torch.dtype,
++        is_mla: bool,
++    ) -> Tuple[int, int, int]:
++        """
++        Resolve GPU strides from runtime tensor layout instead of assuming
++        KVCacheLayout-implied contiguous order.
++        """
++        itemsize = dtype.itemsize
++        shape = sample_tensor.shape
++        strides = sample_tensor.stride()
++
++        block_dim = self._find_dim_by_size(shape, int(gpu_kv_layout.num_block))
++        if block_dim is None:
++            block_dim = 0
++
++        layer_dim = self._find_dim_by_size(
++            shape,
++            int(gpu_kv_layout.num_layer),
++            exclude={block_dim},
++        )
++
++        kv_dim: Optional[int] = None
++        if not is_mla:
++            kv_dim = self._find_dim_by_size(
++                shape,
++                2,
++                exclude={block_dim} | ({layer_dim} if layer_dim is not None else set()),
++            )
++            if kv_dim is None and len(shape) >= 2:
++                kv_dim = 1 if block_dim == 0 else 0
++            if kv_dim == block_dim:
++                kv_dim = None
++
++        block_stride = int(strides[block_dim])
++        kv_stride = int(strides[kv_dim]) if kv_dim is not None else 0
++
++        # Layer stride is meaningful when all layers are packed in one tensor (TRTLLM style).
++        if gpu_block_type == 1 and layer_dim is not None:
++            layer_stride = int(strides[layer_dim])
++        else:
++            layer_stride = int(gpu_kv_layout.get_layer_stride())
++
++        return (
++            kv_stride * itemsize,
++            block_stride * itemsize,
++            layer_stride * itemsize,
++        )
++
+     @classmethod
+     def create_worker(cls,
+                       mp_ctx: Any,
+@@ -305,12 +373,19 @@ class WorkerHandle:
+             self.transfer_conn.close()
+         except (BrokenPipeError, OSError):
+             pass  # Pipe already closed
+-        # set timeout to 5 seconds
+-        self.process.join(timeout=5)
++        # Prefer graceful exit to ensure worker-side pinned buffers are unregistered.
++        self.process.join(timeout=30)
+         if self.process.is_alive():
+             print("force terminate the worker process")
+             self.process.terminate()
+-            self.process.join()
++            self.process.join(timeout=5)
++        if self.process.is_alive():
++            self.process.kill()
++            self.process.join(timeout=2)
++        try:
++            self.process.close()
++        except Exception:
++            pass
+ 
+     def __del__(self) -> None:
+         if self.process.is_alive():
+@@ -337,6 +412,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
+         # Register CPU tensors with CUDA
+         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
+         cudaHostRegister(cpu_blocks)
++        self.cpu_tensor = cpu_blocks
++        self._cpu_tensor_registered = True
+         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
+         # Get pointers first
+         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
+@@ -349,16 +426,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
+ 
+         self.num_layers = gpu_kv_layout.num_layer
+ 
+-        # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
+-        self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+-        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+-        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+-        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+-
+-        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+-        self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+-
+         if len(self.gpu_blocks) == 1:
+             self.gpu_block_type_ = 1
+         elif len(self.gpu_blocks) == self.num_layers:
+@@ -367,6 +434,24 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
+             self.gpu_block_type_ = 2
+         else:
+             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
++
++        # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
++        self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
++        (
++            self.gpu_kv_stride_in_bytes,
++            self.gpu_block_stride_in_bytes,
++            self.gpu_layer_stride_in_bytes,
++        ) = self._resolve_gpu_runtime_strides_in_bytes(
++            sample_tensor=self.gpu_blocks[0],
++            gpu_kv_layout=gpu_kv_layout,
++            gpu_block_type=self.gpu_block_type_,
++            dtype=self.dtype,
++            is_mla=self.is_mla,
++        )
++
++        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
++        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
++        self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+         # set GPU device
+         if gpu_device_id != -1:
+             torch.cuda.set_device(gpu_device_id)
+@@ -376,6 +461,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
+         self.use_ce_transfer_h2d = use_ce_transfer_h2d
+         self.use_ce_transfer_d2h = use_ce_transfer_d2h
+ 
++    def shutdown(self) -> None:
++        if getattr(self, "_cpu_tensor_registered", False):
++            try:
++                cudaHostUnregister(self.cpu_tensor)
++            except Exception as e:
++                flexkv_logger.warning(f"cpu_tensor cudaHostUnregister failed: {e}")
++            self._cpu_tensor_registered = False
++        super().shutdown()
++
+     def _transfer_impl(
+         self,
+         src_block_ids: torch.Tensor,
+@@ -504,17 +598,39 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
+ 
+         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
+         cudaHostRegister(cpu_blocks)
++        self.cpu_tensor = cpu_blocks
++        self._cpu_tensor_registered = True
+ 
+         self.num_layers = gpu_kv_layouts[0].num_layer
+         # here the chunk size doesn't include the layer info
+         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
+                                 for gpu_kv_layout in gpu_kv_layouts]
+-        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
+-                                for gpu_kv_layout in gpu_kv_layouts]
+-        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
+-                                for gpu_kv_layout in gpu_kv_layouts]
+-        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
+-                                for gpu_kv_layout in gpu_kv_layouts]
++        self.gpu_kv_strides_in_bytes = []
++        self.gpu_block_strides_in_bytes = []
++        self.gpu_layer_strides_in_bytes = []
++        for gpu_id, gpu_kv_layout in enumerate(gpu_kv_layouts):
++            num_tensors = len(self.gpu_blocks[gpu_id])
++            if num_tensors == gpu_kv_layout.num_layer:
++                gpu_block_type = 0
++            elif num_tensors == 1:
++                gpu_block_type = 1
++            elif num_tensors == gpu_kv_layout.num_layer * 2:
++                gpu_block_type = 2
++            else:
++                raise ValueError(
++                    f"Invalid tensor count per GPU({gpu_id}): {num_tensors} "
++                    f"for num_layers={gpu_kv_layout.num_layer}"
++                )
++            kv_s, blk_s, lyr_s = self._resolve_gpu_runtime_strides_in_bytes(
++                sample_tensor=self.gpu_blocks[gpu_id][0],
++                gpu_kv_layout=gpu_kv_layout,
++                gpu_block_type=gpu_block_type,
++                dtype=self.dtype,
++                is_mla=self.is_mla,
++            )
++            self.gpu_kv_strides_in_bytes.append(kv_s)
++            self.gpu_block_strides_in_bytes.append(blk_s)
++            self.gpu_layer_strides_in_bytes.append(lyr_s)
+ 
+         self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+         self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+@@ -541,7 +657,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
+             for i in range(self.num_gpus)
+             for j in range(len(self.gpu_blocks[i]))
+         ]
+-        cpu_blocks_ptr = cpu_blocks.data_ptr()
++        cpu_blocks_ptr = self.cpu_tensor.data_ptr()
+         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+         num_tensors_per_gpu = len(self.gpu_blocks[0])
+ 
+@@ -550,7 +666,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
+             gpu_block_ptrs_flat,
+             num_tensors_per_gpu,
+             cpu_blocks_ptr,
+-            dp_group_id,
++            self.dp_group_id,
+             self.num_layers,
+             self.gpu_kv_strides_in_bytes,
+             self.gpu_block_strides_in_bytes,
+@@ -559,6 +675,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
+             gpu_device_ids,
+         )
+ 
++    def shutdown(self) -> None:
++        if getattr(self, "_cpu_tensor_registered", False):
++            try:
++                cudaHostUnregister(self.cpu_tensor)
++            except Exception as e:
++                flexkv_logger.warning(f"tp cpu_tensor cudaHostUnregister failed: {e}")
++            self._cpu_tensor_registered = False
++        super().shutdown()
++
+ 
+     def _transfer_impl(self,
+                        src_block_ids: torch.Tensor,
+@@ -1058,17 +1183,6 @@ class GDSTransferWorker(TransferWorkerBase):
+         gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
+         ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+ 
+-        # GPU layout calculations
+-        self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
+-        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+-        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+-        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+-
+-        # SSD layout calculations
+-        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+-        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+-        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+-
+         if len(self.gpu_blocks) == 1:
+             self.gpu_block_type_ = 1  # TRTLLM
+         elif len(self.gpu_blocks) == self.num_layers:
+@@ -1078,6 +1192,25 @@ class GDSTransferWorker(TransferWorkerBase):
+         else:
+             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
+ 
++        # GPU layout calculations
++        self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
++        (
++            self.gpu_kv_stride_in_bytes,
++            self.gpu_block_stride_in_bytes,
++            self.gpu_layer_stride_in_bytes,
++        ) = self._resolve_gpu_runtime_strides_in_bytes(
++            sample_tensor=self.gpu_blocks[0],
++            gpu_kv_layout=gpu_kv_layout,
++            gpu_block_type=self.gpu_block_type_,
++            dtype=self.dtype,
++            is_mla=self.is_mla,
++        )
++
++        # SSD layout calculations
++        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
++        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
++        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
++
+         # Set GPU device and create stream
+         self.gpu_device_id = gpu_device_id
+         if gpu_device_id != -1:
+@@ -1254,12 +1387,32 @@ class tpGDSTransferWorker(TransferWorkerBase):
+         # GPU layout calculations
+         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
+                                          for gpu_kv_layout in gpu_kv_layouts]
+-        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
+-                                        for gpu_kv_layout in gpu_kv_layouts]
+-        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
+-                                           for gpu_kv_layout in gpu_kv_layouts]
+-        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
+-                                           for gpu_kv_layout in gpu_kv_layouts]
++        self.gpu_kv_strides_in_bytes = []
++        self.gpu_block_strides_in_bytes = []
++        self.gpu_layer_strides_in_bytes = []
++        for gpu_id, gpu_kv_layout in enumerate(gpu_kv_layouts):
++            num_tensors = len(self.gpu_blocks[gpu_id])
++            if num_tensors == gpu_kv_layout.num_layer:
++                gpu_block_type = 0
++            elif num_tensors == 1:
++                gpu_block_type = 1
++            elif num_tensors == gpu_kv_layout.num_layer * 2:
++                gpu_block_type = 2
++            else:
++                raise ValueError(
++                    f"Invalid tensor count per GPU({gpu_id}): {num_tensors} "
++                    f"for num_layers={gpu_kv_layout.num_layer}"
++                )
++            kv_s, blk_s, lyr_s = self._resolve_gpu_runtime_strides_in_bytes(
++                sample_tensor=self.gpu_blocks[gpu_id][0],
++                gpu_kv_layout=gpu_kv_layout,
++                gpu_block_type=gpu_block_type,
++                dtype=self.dtype,
++                is_mla=self.is_mla,
++            )
++            self.gpu_kv_strides_in_bytes.append(kv_s)
++            self.gpu_block_strides_in_bytes.append(blk_s)
++            self.gpu_layer_strides_in_bytes.append(lyr_s)
+ 
+         # SSD layout calculations
+         self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+@@ -1447,15 +1600,10 @@ class NixlTransferWorker(TransferWorkerBase):
+         # GPU pool strides (per tensor layout).
+         gpu_pl = gpu_kv_layout.div_layer(self.num_layers)
+         self.gpu_chunk_size_in_bytes = gpu_pl.get_chunk_size() * self.dtype.itemsize
+-        self.gpu_kv_stride_in_bytes = (
+-            gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+-        )
+-        self.gpu_block_stride_in_bytes = (
+-            gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+-        )
+-        self.gpu_layer_stride_in_bytes = (
+-            gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+-        )
++        # Runtime GPU strides are resolved after importing actual GPU tensors.
++        self.gpu_kv_stride_in_bytes = 0
++        self.gpu_block_stride_in_bytes = 0
++        self.gpu_layer_stride_in_bytes = 0
+ 
+         # CPU pool strides (DRAM side for POSIX / 3FS).
+         self.cpu_chunk_size_in_bytes = (
+@@ -1485,6 +1633,17 @@ class NixlTransferWorker(TransferWorkerBase):
+                 raise ValueError(
+                     f"Invalid GPU block count for NIXL: {len(self.gpu_blocks)}"
+                 )
++            (
++                self.gpu_kv_stride_in_bytes,
++                self.gpu_block_stride_in_bytes,
++                self.gpu_layer_stride_in_bytes,
++            ) = self._resolve_gpu_runtime_strides_in_bytes(
++                sample_tensor=self.gpu_blocks[0],
++                gpu_kv_layout=gpu_kv_layout,
++                gpu_block_type=self.gpu_block_type_,
++                dtype=self.dtype,
++                is_mla=self.is_mla,
++            )
+             self.chunk_size_in_bytes = self.gpu_chunk_size_in_bytes
+             self.gpu_device_id = gpu_device_id
+             if gpu_device_id != -1:
+@@ -1908,6 +2067,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
+             self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
+         # unregist node info from redis server
+         self.unregist_node_meta()
++        super().shutdown()
+ 
+     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+         layer_id = transfer_op.layer_id

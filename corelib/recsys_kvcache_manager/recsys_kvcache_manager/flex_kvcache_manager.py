@@ -80,12 +80,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             len(cache_table_list) == self.num_layers
         ), f"cache_table_list length {len(cache_table_list)} does not match num_layers {self.num_layers}"
 
-        # Use fake view (2, #block, blocksize, #head, headdim) for flexKV registration.
-        # Actual data will be organized in the original GPU cache tensors shape (#block, 2, blocksize, #head, headdim).
-        self._gpu_cache_table_list = [
-            cache_table.permute((1, 0, 2, 3, 4))
-            for cache_table in cache_table_list  # Generate a view by no calling to contiguous() .
-        ]
+        # Register runtime layout directly: [block, kv, block_size, head, head_dim].
+        # FlexKV transfer workers should resolve true runtime strides from tensors.
+        self._gpu_cache_table_list = list(cache_table_list)
 
         # Initialize FlexKV client only after GPU cache table is available.
         self._init_client()
@@ -97,7 +94,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=len(self._gpu_cache_table_list),
-            num_block=int(first_table.shape[1]),
+            num_block=int(first_table.shape[0]),
             tokens_per_block=int(first_table.shape[2]),
             num_head=int(first_table.shape[3]),
             head_size=int(first_table.shape[4]),
