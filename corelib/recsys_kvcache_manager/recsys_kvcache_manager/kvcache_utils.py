@@ -121,4 +121,4 @@ class FlexKVIndexMeta(KVIndexMeta):
 
     token_ids: Optional[torch.Tensor] = None
     token_mask: Optional[torch.Tensor] = None
-    namespaces: Optional[List[str]] = None
+    namespaces: Optional[List[List[str]]] = None
