@@ -189,6 +189,9 @@ class KVCacheManager:
             offloaded_lengths,
             True if self.host_kvstorage_manager.backend_name == "flexkv" else False,
         )
+        print(f"offload_user_ids: {offload_user_ids.tolist()}")
+        print(f"offload_start_indices: {offload_start_indices.tolist()}")
+        print(f"offload_page_indices_list: {[t.size(0) for t in offload_page_indices_list]}")
         # returned with cache pages locked (per user).
         if offload_user_ids.size(0) == 0:
             return None
@@ -227,9 +230,11 @@ class KVCacheManager:
                 remain_tasks.append(task_handle)
                 continue
             if wait_result.status == HostKVTaskStatus.READY:
+                print(f"Offload ready")
                 offload_success = self.host_kvstorage_manager.finish_task(task_handle)
             elif wait_result.status == HostKVTaskStatus.SKIPPED:
                 # No need to release GPU pages since offload is skipped
+                print(f"Offload skipped for {task_handle.get_user_ids().tolist()}")
                 continue
             elif wait_result.status in (
                 HostKVTaskStatus.FAILED,
@@ -248,10 +253,10 @@ class KVCacheManager:
                 raise RuntimeError(
                     f"Unexpected offload wait result status: {wait_result.status.value}, msg={wait_result.message}"
                 )
-            self.gpu_kvcache_mgr.release_offload_pages(
-                *(self.host_kvstorage_manager.get_offload_handle_metadata(task_handle)),
-                offloaded=offload_success,
-            )
+            # self.gpu_kvcache_mgr.release_offload_pages(
+            #     *(self.host_kvstorage_manager.get_offload_handle_metadata(task_handle)),
+            #     offloaded=offload_success,
+            # )
         self.ongoing_offload_tasks = remain_tasks
 
     def evict(

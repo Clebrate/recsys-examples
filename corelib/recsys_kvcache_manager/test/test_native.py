@@ -1,4 +1,5 @@
 import torch
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 
@@ -287,7 +288,10 @@ if __name__ == "__main__":
         assert kvcache_metadata.new_history_nnz == sum(deltalen)
 
         kvcache_mgr.onboard_launch(index_meta, lookup_res, kvcache_metadata)
+        assert kvcache_metadata.kv_onload_handle.status == HostKVTaskStatus.SKIPPED
+
         for layer_idx in range(3):
+            print(f"stream_wait_layer {layer_idx}")
             kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
 
         for layer_idx in range(3):
@@ -300,13 +304,13 @@ if __name__ == "__main__":
 
         assert kvcache_metadata.kv_onload_handle.handle is None
 
-        for layer_idx in range(3):
-            kvcache_mgr.gpu_kvcache_mgr.put(
-                torch.cat([k[layer_idx] for k in new_keys], dim=0),
-                torch.cat([v[layer_idx] for v in new_values], dim=0),
-                layer_idx,
-                kvcache_metadata,
-            )
+        # for layer_idx in range(3):
+        #     kvcache_mgr.gpu_kvcache_mgr.put(
+        #         torch.cat([k[layer_idx] for k in new_keys], dim=0),
+        #         torch.cat([v[layer_idx] for v in new_values], dim=0),
+        #         layer_idx,
+        #         kvcache_metadata,
+        #     )
 
         for i, uid in enumerate(range(0, 8)):
             start, end = (
@@ -384,13 +388,13 @@ if __name__ == "__main__":
             lookup_res.cached_start_indices, torch.zeros((8,), dtype=torch.int32)
         )
         assert torch.allclose(
-            lookup_res.cached_lengths, torch.tensor([cachedlen], dtype=torch.int32)
+            lookup_res.cached_lengths, torch.tensor(cachedlen, dtype=torch.int32)
         )
         assert torch.allclose(
             lookup_res.gpu_cached_lengths, torch.zeros((8,), dtype=torch.int32)
         )
         assert torch.allclose(
-            lookup_res.host_cached_lengths, torch.tensor([cachedlen], dtype=torch.int32)
+            lookup_res.host_cached_lengths, torch.tensor(cachedlen, dtype=torch.int32)
         )
 
         kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
@@ -515,13 +519,13 @@ if __name__ == "__main__":
             lookup_res.cached_start_indices, torch.zeros((8,), dtype=torch.int32)
         )
         assert torch.allclose(
-            lookup_res.cached_lengths, torch.tensor([cachedlen], dtype=torch.int32)
+            lookup_res.cached_lengths, torch.tensor(cachedlen, dtype=torch.int32)
         )
         assert torch.allclose(
             lookup_res.gpu_cached_lengths, torch.zeros((8,), dtype=torch.int32)
         )
         assert torch.allclose(
-            lookup_res.host_cached_lengths, torch.tensor([cachedlen], dtype=torch.int32)
+            lookup_res.host_cached_lengths, torch.tensor(cachedlen, dtype=torch.int32)
         )
 
         kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
@@ -640,7 +644,7 @@ if __name__ == "__main__":
             lookup_res.cached_start_indices, torch.zeros((8,), dtype=torch.int32)
         )
         assert torch.allclose(
-            lookup_res.cached_lengths, torch.tensor([cachedlen], dtype=torch.int32)
+            lookup_res.cached_lengths, torch.tensor(cachedlen, dtype=torch.int32)
         )
         assert torch.allclose(
             lookup_res.gpu_cached_start_indices,
