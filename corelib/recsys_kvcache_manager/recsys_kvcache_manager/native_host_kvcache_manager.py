@@ -190,7 +190,7 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
             ready=is_ready,
         )
 
-    def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
+    def finish_task(self, task_handle: HostKVTaskHandle) -> List[int]:
         if isinstance(task_handle.handle, KVOnloadHandle):
             raise NotImplementedError(
                 "Finish onload by layer is supported, but not the whole task at once, since the native implementation uses layerwise synchronization."
@@ -199,7 +199,9 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
             return self.impl_.finish_offload(task_handle.handle)
         else:
             raise ValueError(f"Unknown task handle type: {type(task_handle.handle)}")
-        return False
+
+        # Should not reach
+        # return [0 for _ in range(task_handle.handle.get_user_ids().size(0))]
 
     def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
         if isinstance(task_handle.handle, KVOnloadHandle):
@@ -210,7 +212,9 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
             return self.impl_.cancel_offload(task_handle.handle)
         else:
             raise ValueError(f"Unknown task handle type: {type(task_handle.handle)}")
-        return False
+
+        # Should not reach
+        # return False
 
     def evict(self, user_ids: torch.Tensor) -> None:
         for uid in user_ids.tolist():

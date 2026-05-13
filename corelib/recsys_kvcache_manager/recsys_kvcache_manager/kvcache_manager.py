@@ -20,9 +20,9 @@ class KVCacheManager:
     def __init__(
         self,
         gpu_kvcache_manager: GPUKVCacheManager,
-        host_kvstorage_manager: Optional[HostKVStorageManagerBase] = None,
+        host_kvstorage_manager: HostKVStorageManagerBase,
         offload_mode: str = "lazy",
-        # host_kvstorage_fail_policy: str = "fail_open",
+        host_kvstorage_fail_policy: str = "fail_open",
     ):
         # self.num_layers = num_layers
         # self.num_heads = num_kv_heads
@@ -46,7 +46,7 @@ class KVCacheManager:
             if offload_mode in {m.value for m in KVCacheOffloadMode}
             else KVCacheOffloadMode.LAZY
         )
-        # self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
+        self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.ongoing_onboard_tasks: List[HostKVTaskHandle] = []
         self.ongoing_offload_tasks: List[HostKVTaskHandle] = []
 
@@ -130,17 +130,14 @@ class KVCacheManager:
             HostKVTaskStatus.CANCELLED,
         ):
             if task_handle.backend == "flexkv":
-                fail_policy = getattr(
-                    self.host_kvstorage_manager,
-                    "host_kvstorage_fail_policy",
-                    "fail_open",
-                )
-                if fail_policy == "fail_close":
+                if self.host_kvstorage_fail_policy == "fail_close":
                     raise RuntimeError(
                         f"Onboarding failed for {wait_result.failed_user_ids}"
                     )
-            metadata = task_handle.metadata or {}
-
+                else:
+                    print(
+                        f"[WARNING] Onboarding failed for {wait_result.failed_user_ids}, but continue with `fail_open` policy."
+                    )
             # Revoke affected pages on onboard failure.
             self.gpu_kvcache_mgr.revoke_onboard_pages(
                 kv_index_meta.user_ids,
@@ -189,9 +186,6 @@ class KVCacheManager:
             offloaded_lengths,
             True if self.host_kvstorage_manager.backend_name == "flexkv" else False,
         )
-        print(f"offload_user_ids: {offload_user_ids.tolist()}")
-        print(f"offload_start_indices: {offload_start_indices.tolist()}")
-        print(f"offload_page_indices_list: {[t.size(0) for t in offload_page_indices_list]}")
         # returned with cache pages locked (per user).
         if offload_user_ids.size(0) == 0:
             return None
@@ -230,7 +224,6 @@ class KVCacheManager:
                 remain_tasks.append(task_handle)
                 continue
             if wait_result.status == HostKVTaskStatus.READY:
-                print(f"Offload ready")
                 offload_success = self.host_kvstorage_manager.finish_task(task_handle)
             elif wait_result.status == HostKVTaskStatus.SKIPPED:
                 # No need to release GPU pages since offload is skipped
@@ -244,19 +237,18 @@ class KVCacheManager:
                 should_raise = self.host_kvstorage_fail_policy == "fail_close"
                 offload_success = [0 for _ in range(task_handle.get_user_ids().size(0))]
                 if should_raise:
-                    if self.host_kvstorage_manager.backend_name == "flexkv":
-                        raise RuntimeError(
-                            f"Offloading failed for {wait_result.failed_user_ids}, fail_policy={self.host_kvstorage_fail_policy}"
-                        )
+                    raise RuntimeError(
+                        f"Offloading failed for {wait_result.failed_user_ids}, fail_policy={self.host_kvstorage_fail_policy}"
+                    )
                 self.host_kvstorage_manager.cancel_task(task_handle)
             else:
                 raise RuntimeError(
                     f"Unexpected offload wait result status: {wait_result.status.value}, msg={wait_result.message}"
                 )
-            # self.gpu_kvcache_mgr.release_offload_pages(
-            #     *(self.host_kvstorage_manager.get_offload_handle_metadata(task_handle)),
-            #     offloaded=offload_success,
-            # )
+            self.gpu_kvcache_mgr.release_offload_pages(
+                *(self.host_kvstorage_manager.get_offload_handle_metadata(task_handle)),
+                offloaded=offload_success,
+            )
         self.ongoing_offload_tasks = remain_tasks
 
     def evict(
@@ -306,7 +298,7 @@ class KVCacheManager:
             flexkv_num_local_blocks = int(extra.get("flexkv_num_local_blocks", 4096))
             flexkv_num_tmp_cpu_blocks = int(extra.get("flexkv_num_tmp_cpu_blocks", 256))
             flexkv_host_kvstorage_fail_policy = str(
-                extra.get("flexkv_host_kvstorage_fail_policy", "fail_open")
+                extra.get("flexkv_host_kvstorage_fail_policy", "fail_close")
             )
             flexkv_enable_mps_raw = extra.get("flexkv_enable_mps", 0)
             if isinstance(flexkv_enable_mps_raw, str):
@@ -327,21 +319,17 @@ class KVCacheManager:
                 num_heads=kvcache_config.num_heads,
                 head_dim=kvcache_config.head_dim,
                 page_size=kvcache_config.page_size,
-                hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
-                host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 num_cpu_blocks=flexkv_num_cpu_blocks,
                 num_local_blocks=flexkv_num_local_blocks,
                 num_tmp_cpu_blocks=flexkv_num_tmp_cpu_blocks,
                 enable_mps=flexkv_enable_mps,
-                # hostkv_wait_timeout_ms=hostkv_wait_timeout_ms,
-                # host_kvstorage_fail_policy=host_kvstorage_fail_policy,
+                host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
+                hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
             )
         else:
             raise NotImplementedError(
                 f"Unknown host kvcache backend {kvcache_config.host_kvstorage_backend}"
             )
-
-        return None
 
     @classmethod
     def from_config(cls, kvcache_config):

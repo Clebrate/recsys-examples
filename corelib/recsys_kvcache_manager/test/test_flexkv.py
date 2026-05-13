@@ -1,7 +1,6 @@
 import time
 
 import torch
-
 from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
@@ -31,7 +30,7 @@ def create_testing_kvcache_manager() -> KVCacheManager:
         },
     )
     print(
-        f"[DEBUG] KVCache GPU Memory Usage: {\
+        f"[TEST] KVCache GPU Memory Usage: {\
         (kvcache_config.num_layers * \
         kvcache_config.num_primary_cache_pages * \
         kvcache_config.page_size * \
@@ -40,13 +39,13 @@ def create_testing_kvcache_manager() -> KVCacheManager:
         } GiB."
     )
     print(
-        f"[DEBUG] KVCache Host Memory Usage: {\
+        f"[TEST] KVCache Host Memory Usage: {\
         kvcache_config.num_layers * \
         kvcache_config.host_capacity_per_layer / (1024. ** 3) \
         } GiB."
     )
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
-    print("[DEBUG] Created KVCache Manager")
+    print("[TEST] Created KVCache Manager")
     return kvcache_mgr
 
 
@@ -76,7 +75,9 @@ def run_phase_1(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
 
     kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
     if getattr(kvcache_metadata, "new_history_nnz_cuda", None) is not None:
-        kvcache_metadata.new_history_nnz = int(kvcache_metadata.new_history_nnz_cuda.item())
+        kvcache_metadata.new_history_nnz = int(
+            kvcache_metadata.new_history_nnz_cuda.item()
+        )
     assert torch.allclose(
         kvcache_metadata.kv_indices,
         torch.tensor(list(range(0, 125)), dtype=torch.int32).cuda(),
@@ -87,17 +88,21 @@ def run_phase_1(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert torch.allclose(
         kvcache_metadata.kv_last_page_len,
-        torch.tensor([i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32).cuda(),
+        torch.tensor(
+            [i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32
+        ).cuda(),
     )
     assert torch.allclose(
         kvcache_metadata.total_history_lengths, sequence_lengths.cuda()
     )
     assert torch.allclose(
-        kvcache_metadata.total_history_offsets[1:] - kvcache_metadata.total_history_offsets[:-1],
+        kvcache_metadata.total_history_offsets[1:]
+        - kvcache_metadata.total_history_offsets[:-1],
         sequence_lengths.cuda(),
     )
     assert torch.allclose(
-        kvcache_metadata.new_history_offsets[1:] - kvcache_metadata.new_history_offsets[:-1],
+        kvcache_metadata.new_history_offsets[1:]
+        - kvcache_metadata.new_history_offsets[:-1],
         sequence_lengths.cuda(),
     )
     assert torch.allclose(
@@ -131,8 +136,6 @@ def run_phase_1(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
                 cached_v, v[layer_idx]
             ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
-    print(f"index_meta.user_ids: {index_meta.user_ids.tolist()}")
-    
     task_handle = kvcache_mgr.offload_launch(
         index_meta=index_meta,
         kvcache_metadata=kvcache_metadata,
@@ -147,8 +150,6 @@ def run_phase_1(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
     host_lens = [int(x.item()) for x in post_lookup.host_cached_lengths]
-    print(f"post_lookup: {post_lookup.host_cached_lengths}")
-    print(f"host_lens: {host_lens}")
     assert host_lens == expected_host_lens, (
         "Phase1 host_cached_lengths mismatch after offload. "
         f"expected={expected_host_lens}, actual={host_lens}. "
@@ -194,26 +195,34 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
 
     kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
     if getattr(kvcache_metadata, "new_history_nnz_cuda", None) is not None:
-        kvcache_metadata.new_history_nnz = int(kvcache_metadata.new_history_nnz_cuda.item())
+        kvcache_metadata.new_history_nnz = int(
+            kvcache_metadata.new_history_nnz_cuda.item()
+        )
 
     assert kvcache_metadata.kv_indices.size(0) == 245
     assert torch.allclose(
         kvcache_metadata.kv_indptr,
-        torch.tensor([0, 44, 52, 73, 112, 143, 166, 211, 245], dtype=torch.int32).cuda(),
+        torch.tensor(
+            [0, 44, 52, 73, 112, 143, 166, 211, 245], dtype=torch.int32
+        ).cuda(),
     )
     assert torch.allclose(
         kvcache_metadata.kv_last_page_len,
-        torch.tensor([i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32).cuda(),
+        torch.tensor(
+            [i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32
+        ).cuda(),
     )
     assert torch.allclose(
         kvcache_metadata.total_history_lengths, sequence_lengths.cuda()
     )
     assert torch.allclose(
-        kvcache_metadata.total_history_offsets[1:] - kvcache_metadata.total_history_offsets[:-1],
+        kvcache_metadata.total_history_offsets[1:]
+        - kvcache_metadata.total_history_offsets[:-1],
         sequence_lengths.cuda(),
     )
     assert torch.allclose(
-        kvcache_metadata.new_history_offsets[1:] - kvcache_metadata.new_history_offsets[:-1],
+        kvcache_metadata.new_history_offsets[1:]
+        - kvcache_metadata.new_history_offsets[:-1],
         torch.tensor(deltalen, dtype=torch.int32).cuda(),
     )
     assert torch.allclose(
@@ -223,13 +232,11 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     assert kvcache_metadata.new_history_nnz == sum(deltalen)
 
     kvcache_mgr.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-    # Phase2 onboard is expected to be SKIPPED (no real onboard handle/task),
-    # so stream_wait_layer here is a no-op and can be misleading in test logs.
-    # for layer_idx in range(3):
-    #     print(f"stream_wait_layer {layer_idx}")
-    #     kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
-    assert kvcache_metadata.kv_onload_handle.handle is None
     assert kvcache_metadata.kv_onload_handle.status == HostKVTaskStatus.SKIPPED
+
+    for layer_idx in range(3):
+        kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
+    assert kvcache_metadata.kv_onload_handle.handle is None
 
     for layer_idx in range(3):
         kvcache_mgr.gpu_kvcache_mgr.put(
@@ -263,7 +270,7 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
             assert torch.allclose(
                 cached_v, v[layer_idx]
             ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
-    
+
     task_handle = kvcache_mgr.offload_launch(
         index_meta=index_meta,
         kvcache_metadata=kvcache_metadata,
@@ -276,12 +283,9 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
             break
 
     expected_host_lens = [s // 32 * 32 for s in seqlen]
-    
-    
+
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
     host_lens = [int(x.item()) for x in post_lookup.host_cached_lengths]
-    print(f"post_lookup: {post_lookup.host_cached_lengths}")
-    print(f"host_lens: {host_lens}")
 
     assert host_lens == expected_host_lens, (
         "Phase2 host_cached_lengths mismatch after offload. "
@@ -329,22 +333,28 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
 
     kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
     if getattr(kvcache_metadata, "new_history_nnz_cuda", None) is not None:
-        kvcache_metadata.new_history_nnz = int(kvcache_metadata.new_history_nnz_cuda.item())
+        kvcache_metadata.new_history_nnz = int(
+            kvcache_metadata.new_history_nnz_cuda.item()
+        )
 
     assert kvcache_metadata.kv_indices.size(0) == 354
     assert torch.allclose(
         kvcache_metadata.kv_last_page_len,
-        torch.tensor([i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32).cuda(),
+        torch.tensor(
+            [i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32
+        ).cuda(),
     )
     assert torch.allclose(
         kvcache_metadata.total_history_lengths, sequence_lengths.cuda()
     )
     assert torch.allclose(
-        kvcache_metadata.total_history_offsets[1:] - kvcache_metadata.total_history_offsets[:-1],
+        kvcache_metadata.total_history_offsets[1:]
+        - kvcache_metadata.total_history_offsets[:-1],
         sequence_lengths.cuda(),
     )
     assert torch.allclose(
-        kvcache_metadata.new_history_offsets[1:] - kvcache_metadata.new_history_offsets[:-1],
+        kvcache_metadata.new_history_offsets[1:]
+        - kvcache_metadata.new_history_offsets[:-1],
         torch.tensor(deltalen, dtype=torch.int32).cuda(),
     )
     assert torch.allclose(
@@ -353,7 +363,9 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert kvcache_metadata.new_history_nnz == sum(deltalen)
 
-    onboard_task_handle = kvcache_mgr.onboard_launch(index_meta, lookup_res, kvcache_metadata)
+    onboard_task_handle = kvcache_mgr.onboard_launch(
+        index_meta, lookup_res, kvcache_metadata
+    )
     assert onboard_task_handle is not None and onboard_task_handle.handle is not None
     assert onboard_task_handle.status == HostKVTaskStatus.LAUNCHED, (
         "phase3 onboard launch was not LAUNCHED, "
@@ -365,15 +377,10 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     while time.time() < onboard_deadline:
         onboard_wait_result = kvcache_mgr.onboard_wait(index_meta, onboard_task_handle)
         if onboard_wait_result.ready:
-            print(f"onboard_wait_result: {onboard_wait_result}")
             onboard_ready = True
             break
         time.sleep(0.01)
-    if not onboard_ready:
-        print(
-            "[WARN] phase3 onboard_wait never reached ready=True within timeout; "
-            "fallback to finish_task(completely=True)."
-        )
+    assert onboard_ready, "phase3 onboard_wait never reached ready=True within timeout."
 
     for layer_idx in range(3):
         kvcache_mgr.gpu_kvcache_mgr.put(
@@ -414,8 +421,6 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
     host_lens = [int(x.item()) for x in post_lookup.host_cached_lengths]
-    print(f"post_lookup: {post_lookup.host_cached_lengths}")
-    print(f"host_lens: {host_lens}")
     assert host_lens == expected_host_lens, (
         "Phase3 host_cached_lengths mismatch after offload. "
         f"expected={expected_host_lens}, actual={host_lens}. "
@@ -433,7 +438,9 @@ def run_phase_4(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     sequence_lengths = torch.tensor(seqlen, dtype=torch.int32)
 
     keys = [all_keys[uid][:, : seqlen[i], ...] for i, uid in enumerate(range(8, 16))]
-    values = [all_values[uid][:, : seqlen[i], ...] for i, uid in enumerate(range(8, 16))]
+    values = [
+        all_values[uid][:, : seqlen[i], ...] for i, uid in enumerate(range(8, 16))
+    ]
 
     new_keys = [k[:, cachedlen[i] : seqlen[i], ...] for i, k in enumerate(keys)]
     new_values = [v[:, cachedlen[i] : seqlen[i], ...] for i, v in enumerate(values)]
@@ -464,22 +471,28 @@ def run_phase_4(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
 
     kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
     if getattr(kvcache_metadata, "new_history_nnz_cuda", None) is not None:
-        kvcache_metadata.new_history_nnz = int(kvcache_metadata.new_history_nnz_cuda.item())
+        kvcache_metadata.new_history_nnz = int(
+            kvcache_metadata.new_history_nnz_cuda.item()
+        )
 
     assert kvcache_metadata.kv_indices.size(0) == 290
     assert torch.allclose(
         kvcache_metadata.kv_last_page_len,
-        torch.tensor([i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32).cuda(),
+        torch.tensor(
+            [i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32
+        ).cuda(),
     )
     assert torch.allclose(
         kvcache_metadata.total_history_lengths, sequence_lengths.cuda()
     )
     assert torch.allclose(
-        kvcache_metadata.total_history_offsets[1:] - kvcache_metadata.total_history_offsets[:-1],
+        kvcache_metadata.total_history_offsets[1:]
+        - kvcache_metadata.total_history_offsets[:-1],
         sequence_lengths.cuda(),
     )
     assert torch.allclose(
-        kvcache_metadata.new_history_offsets[1:] - kvcache_metadata.new_history_offsets[:-1],
+        kvcache_metadata.new_history_offsets[1:]
+        - kvcache_metadata.new_history_offsets[:-1],
         torch.tensor(deltalen, dtype=torch.int32).cuda(),
     )
     assert torch.allclose(
@@ -527,8 +540,6 @@ def run_phase_4(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
     host_lens = [int(x.item()) for x in post_lookup.host_cached_lengths]
-    print(f"post_lookup: {post_lookup.host_cached_lengths}")
-    print(f"host_lens: {host_lens}")
     assert host_lens == expected_host_lens, (
         "Phase4 host_cached_lengths mismatch after offload. "
         f"expected={expected_host_lens}, actual={host_lens}. "
@@ -564,16 +575,7 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     assert torch.allclose(
         lookup_res.host_cached_lengths, torch.tensor(host_cachedlen, dtype=torch.int32)
     )
-    print(f"phase5 lookup cached_lengths={[int(x.item()) for x in lookup_res.cached_lengths]}")
-    print(
-        "phase5 lookup gpu_cached_start_indices="
-        f"{[int(x.item()) for x in lookup_res.gpu_cached_start_indices]}"
-    )
-    print(
-        "phase5 lookup gpu_cached_lengths="
-        f"{[int(x.item()) for x in lookup_res.gpu_cached_lengths]}"
-    )
-    host_cached_runtime = [int(x.item()) for x in lookup_res.host_cached_lengths]
+    [int(x.item()) for x in lookup_res.host_cached_lengths]
     cachedlen_runtime = [int(x.item()) for x in lookup_res.cached_lengths]
     for i in range(8):
         assert host_cachedlen[i] <= cachedlen_runtime[i] <= cachedlen[i], (
@@ -584,26 +586,34 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
 
     deltalen = [seqlen[i] - cachedlen_runtime[i] for i in range(8)]
     new_keys = [k[:, cachedlen_runtime[i] : seqlen[i], ...] for i, k in enumerate(keys)]
-    new_values = [v[:, cachedlen_runtime[i] : seqlen[i], ...] for i, v in enumerate(values)]
+    new_values = [
+        v[:, cachedlen_runtime[i] : seqlen[i], ...] for i, v in enumerate(values)
+    ]
 
     kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
     if getattr(kvcache_metadata, "new_history_nnz_cuda", None) is not None:
-        kvcache_metadata.new_history_nnz = int(kvcache_metadata.new_history_nnz_cuda.item())
+        kvcache_metadata.new_history_nnz = int(
+            kvcache_metadata.new_history_nnz_cuda.item()
+        )
 
     assert kvcache_metadata.kv_indices.size(0) == 478
     assert torch.allclose(
         kvcache_metadata.kv_last_page_len,
-        torch.tensor([i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32).cuda(),
+        torch.tensor(
+            [i % 32 if i % 32 > 0 else 32 for i in seqlen], dtype=torch.int32
+        ).cuda(),
     )
     assert torch.allclose(
         kvcache_metadata.total_history_lengths, sequence_lengths.cuda()
     )
     assert torch.allclose(
-        kvcache_metadata.total_history_offsets[1:] - kvcache_metadata.total_history_offsets[:-1],
+        kvcache_metadata.total_history_offsets[1:]
+        - kvcache_metadata.total_history_offsets[:-1],
         sequence_lengths.cuda(),
     )
     assert torch.allclose(
-        kvcache_metadata.new_history_offsets[1:] - kvcache_metadata.new_history_offsets[:-1],
+        kvcache_metadata.new_history_offsets[1:]
+        - kvcache_metadata.new_history_offsets[:-1],
         torch.tensor(deltalen, dtype=torch.int32).cuda(),
     )
     assert torch.allclose(
@@ -612,28 +622,27 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert kvcache_metadata.new_history_nnz == sum(deltalen)
 
-    onboarded_uids = set()
-    onboard_task_handle = kvcache_mgr.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-    if onboard_task_handle is not None and onboard_task_handle.handle is not None:
-        assert onboard_task_handle.status == HostKVTaskStatus.LAUNCHED, (
-            "phase5 onboard launch failed, "
-            f"status={onboard_task_handle.status}, metadata={onboard_task_handle.metadata}"
+    onboard_task_handle = kvcache_mgr.onboard_launch(
+        index_meta, lookup_res, kvcache_metadata
+    )
+    assert onboard_task_handle.status == HostKVTaskStatus.LAUNCHED, (
+        "phase5 onboard launch failed, "
+        f"status={onboard_task_handle.status}, metadata={onboard_task_handle.metadata}"
+    )
+
+    onboard_deadline = time.time() + 60.0
+    onboard_ready = False
+    while time.time() < onboard_deadline:
+        onboard_wait_result = kvcache_mgr.onboard_wait(index_meta, onboard_task_handle)
+        if onboard_wait_result.ready:
+            onboard_ready = True
+            break
+        time.sleep(0.01)
+    if not onboard_ready:
+        print(
+            "[WARN] phase5 onboard_wait never reached ready=True within timeout; "
+            "fallback to finish_task(completely=True)."
         )
-        onboarded_uids = set(int(x) for x in onboard_task_handle.handle.uids.tolist())
-    if onboard_task_handle is not None and onboard_task_handle.handle is not None:
-        onboard_deadline = time.time() + 60.0
-        onboard_ready = False
-        while time.time() < onboard_deadline:
-            onboard_wait_result = kvcache_mgr.onboard_wait(index_meta, onboard_task_handle)
-            if onboard_wait_result.ready:
-                onboard_ready = True
-                break
-            time.sleep(0.01)
-        if not onboard_ready:
-            print(
-                "[WARN] phase5 onboard_wait never reached ready=True within timeout; "
-                "fallback to finish_task(completely=True)."
-            )
 
     for layer_idx in range(3):
         kvcache_mgr.gpu_kvcache_mgr.put(
@@ -644,6 +653,10 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
         )
 
     for i, uid in enumerate(range(0, 8)):
+        start, end = (
+            kvcache_metadata.total_history_offsets[i],
+            kvcache_metadata.total_history_offsets[i + 1],
+        )
         k, v = keys[i], values[i]
         for layer_idx in range(3):
             page_ids = kvcache_metadata.kv_indices[
@@ -653,38 +666,12 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
             cached_k, cached_v = kvcache_mgr.gpu_kvcache_mgr.get(
                 page_ids, last_page_lens, layer_idx
             )
-            stable_prefix = host_cached_runtime[i]
-            delta_start = cachedlen_runtime[i]
-            uid_int = int(user_ids[i].item())
-            # allocate-evict may reclaim old GPU pages; prefix is deterministic only if onboarded.
-            if uid_int in onboarded_uids and stable_prefix > 0:
-                assert torch.allclose(
-                    cached_k[:stable_prefix], k[layer_idx][:stable_prefix]
-                ), (
-                    f"Layer {layer_idx} key prefix mismatch for uid {uid_int} "
-                    f"(stable_prefix={stable_prefix}, delta_start={delta_start})"
-                )
-                assert torch.allclose(
-                    cached_v[:stable_prefix], v[layer_idx][:stable_prefix]
-                ), (
-                    f"Layer {layer_idx} value prefix mismatch for uid {uid_int} "
-                    f"(stable_prefix={stable_prefix}, delta_start={delta_start})"
-                )
-
-            # Delta range is written in this round and must be deterministic.
-            if delta_start < seqlen[i]:
-                assert torch.allclose(
-                    cached_k[delta_start:], k[layer_idx][delta_start:]
-                ), (
-                    f"Layer {layer_idx} key delta mismatch for uid {uid_int} "
-                    f"(stable_prefix={stable_prefix}, delta_start={delta_start})"
-                )
-                assert torch.allclose(
-                    cached_v[delta_start:], v[layer_idx][delta_start:]
-                ), (
-                    f"Layer {layer_idx} value delta mismatch for uid {uid_int} "
-                    f"(stable_prefix={stable_prefix}, delta_start={delta_start})"
-                )
+            assert torch.allclose(
+                cached_k, k[layer_idx]
+            ), f"Layer {layer_idx} key mismatch for uid {user_ids[i].item()}"
+            assert torch.allclose(
+                cached_v, v[layer_idx]
+            ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
     task_handle = kvcache_mgr.offload_launch(
         index_meta=index_meta,
@@ -749,17 +736,23 @@ if __name__ == "__main__":
             1189,
         ]
         g_keys = [
-            torch.randn((3, max_sequence_lengths[i], 4, 128), dtype=torch.bfloat16).cuda()
+            torch.randn(
+                (3, max_sequence_lengths[i], 4, 128), dtype=torch.bfloat16
+            ).cuda()
             for i in range(len(max_sequence_lengths))
         ]
         g_values = [
-            torch.randn((3, max_sequence_lengths[i], 4, 128), dtype=torch.bfloat16).cuda()
+            torch.randn(
+                (3, max_sequence_lengths[i], 4, 128), dtype=torch.bfloat16
+            ).cuda()
             for i in range(len(max_sequence_lengths))
         ]
         print("Testing Phase 1: Allocate total and Offload total ...")
         run_phase_1(kvcache_mgr, g_keys, g_values)
         print("                 ... Passed.")
-        print("Testing Phase 2: Allocate partial, Onboard skipped and Offload partial ...")
+        print(
+            "Testing Phase 2: Allocate partial, Onboard skipped and Offload partial ..."
+        )
         run_phase_2(kvcache_mgr, g_keys, g_values)
         print("                 ... Passed.")
         print("Testing Phase 3: Evict GPU, onboard host, put delta and offload ...")

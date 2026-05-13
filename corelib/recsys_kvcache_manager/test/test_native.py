@@ -23,7 +23,7 @@ def create_testing_kvcache_manager():
         offload_mode="lazy",
     )
     print(
-        f"[DEBUG] KVCache GPU Memory Usage: {\
+        f"[TEST] KVCache GPU Memory Usage: {\
         (kvcache_config.num_layers * \
         kvcache_config.num_primary_cache_pages * \
         kvcache_config.page_size * \
@@ -32,14 +32,14 @@ def create_testing_kvcache_manager():
         } GiB."
     )
     print(
-        f"[DEBUG] KVCache Host Memory Usage: {\
+        f"[TEST] KVCache Host Memory Usage: {\
         kvcache_config.num_layers * \
         kvcache_config.host_capacity_per_layer / (1024. ** 3) \
         } GiB."
     )
 
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
-    print(f"[DEBUG] Created KVCache Manager")
+    print(f"[TEST] Created KVCache Manager")
     return kvcache_mgr
 
 
@@ -291,8 +291,8 @@ if __name__ == "__main__":
         assert kvcache_metadata.kv_onload_handle.status == HostKVTaskStatus.SKIPPED
 
         for layer_idx in range(3):
-            print(f"stream_wait_layer {layer_idx}")
             kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
+        assert kvcache_metadata.kv_onload_handle.handle is None
 
         for layer_idx in range(3):
             kvcache_mgr.gpu_kvcache_mgr.put(
@@ -301,16 +301,6 @@ if __name__ == "__main__":
                 layer_idx,
                 kvcache_metadata,
             )
-
-        assert kvcache_metadata.kv_onload_handle.handle is None
-
-        # for layer_idx in range(3):
-        #     kvcache_mgr.gpu_kvcache_mgr.put(
-        #         torch.cat([k[layer_idx] for k in new_keys], dim=0),
-        #         torch.cat([v[layer_idx] for v in new_values], dim=0),
-        #         layer_idx,
-        #         kvcache_metadata,
-        #     )
 
         for i, uid in enumerate(range(0, 8)):
             start, end = (

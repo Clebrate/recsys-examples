@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.server.client import KVTPClient
+
 try:
     from flexkv.common.request import KVResponse, KVResponseStatus
 except Exception:
@@ -32,11 +33,18 @@ class _FlexKVOnloadHandle:
     slot_mappings: List[torch.Tensor]
 
 
-@dataclass
 class _FlexKVOffloadHandle:
-    task_ids: List[int]
-    uids: torch.Tensor
-    seqlens: torch.Tensor
+    def __init__(
+        self,
+        task_ids: List[int],
+        uids: torch.Tensor,
+        seqlens: torch.Tensor,
+        responses: Dict[int, Any] = dict(),
+    ):
+        self.task_ids = task_ids
+        self.uids = uids
+        self.seqlens = seqlens
+        self.responses = responses
 
 
 @dataclass
@@ -78,6 +86,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         num_cpu_blocks: int = 4096,
         num_local_blocks: int = 4096,
         num_tmp_cpu_blocks: int = 256,
+        dtype: torch.dtype = torch.bfloat16,
         enable_mps: bool = False,
         hostkv_wait_timeout_ms: int = 0,
         host_kvstorage_fail_policy: str = "fail_open",
@@ -92,6 +101,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self.num_cpu_blocks = int(num_cpu_blocks)
         self.num_local_blocks = int(num_local_blocks)
         self.num_tmp_cpu_blocks = int(num_tmp_cpu_blocks)
+        self.dtype = dtype
         self.hostkv_wait_timeout_ms = int(hostkv_wait_timeout_ms)
         self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.enable_mps = bool(enable_mps)
@@ -165,7 +175,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             head_size=self.head_dim,
             tp_size=1,
             dp_size=1,
-            dtype=torch.bfloat16,
+            dtype=self.dtype,
         )
         cache_cfg_kwargs: Dict[str, Any] = {"tokens_per_block": self.page_size}
         # Configure CPU cache sizes if specified.
@@ -182,57 +192,6 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             dp_client_id=0,
         )
         self._client.start()
-
-    # - Applies timeout when hostkv_wait_timeout_ms > 0.
-    # - Maps FlexKV wait responses into HostKVTaskStatus.
-    def _try_wait_offload_and_map_result(
-        self,
-        task_ids: List[int],
-        user_ids: List[int],
-    ) -> HostKVWaitResult:
-        responses = self._client.try_wait(task_ids)
-
-        has_unready = False
-        # has_timeout = False
-        has_cancelled = False
-        has_failed = False
-        msgs: List[str] = []
-        for task_ids, resp in responses.items():
-            msgs.append(f"{task_ids}:{resp.status}")
-            if resp.status == KVResponseStatus.SUCCESS:
-                continue
-            elif resp.status == KVResponseStatus.UNREADY:
-                has_unready = True
-            # if resp.status == KVResponseStatus.TIMEOUT:
-            #     has_timeout = True
-            elif resp.status == KVResponseStatus.CANCELLED:
-                has_cancelled = True
-            else:
-                has_failed = True
-        # if has_timeout:
-        #     return HostKVWaitResult(
-        #         status=HostKVTaskStatus.TIMEOUT,
-        #         ready=False,
-        #         message=";".join(msgs),
-        #         failed_user_ids=user_ids,
-        #     )
-        if has_failed or has_cancelled:
-            return HostKVWaitResult(
-                status=HostKVTaskStatus.CANCELLED
-                if has_cancelled and not has_failed
-                else HostKVTaskStatus.FAILED,
-                ready=False,
-                message=";".join(msgs),
-                failed_user_ids=user_ids,
-            )
-        if has_unready:
-            return HostKVWaitResult(
-                status=HostKVTaskStatus.LAUNCHED,
-                ready=False,
-                message=";".join(msgs),
-                failed_user_ids=user_ids,
-            )
-        return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
 
     def build_index_meta(
         self,
@@ -264,7 +223,8 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
     def lookup_kvcache(self, index_meta: KVIndexMeta) -> KVLookupResult:
         if getattr(index_meta, "namespaces", None) is None:
             index_meta.namespaces = [
-                [f"uid:{int(uid)}"] for uid in index_meta.user_ids.detach().cpu().tolist()
+                [f"uid:{int(uid)}"]
+                for uid in index_meta.user_ids.detach().cpu().tolist()
             ]
 
         requests = self._adapter.to_get_match_requests(index_meta)
@@ -335,9 +295,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         # Step 1. Filter out uids not to onboard
         onboard_uids = list()
         onboard_task_ids = list()
-        onboard_slot_mappings = list()
         onboard_start_indices = list()
         onboard_lengths = list()
+        onboard_slot_mappings = list()
         for i in range(index_meta.batch_size):
             if lookup_result.cached_lengths[i].item() == 0:
                 continue
@@ -359,7 +319,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
-                onboard_lengths.append(index_meta.sequence_lengths[i].item())
+                onboard_lengths.append(index_meta.seq_lengths[i].item())
                 onboard_slot_mappings.append(slot_mapping)
                 continue
 
@@ -374,7 +334,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
-                onboard_lengths.append(index_meta.sequence_lengths[i].item())
+                onboard_lengths.append(index_meta.seq_lengths[i].item())
                 onboard_slot_mappings.append(slot_mapping)
                 continue
 
@@ -484,15 +444,17 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         for idx in range(offload_user_ids.size(0)):
             token_ids = index_meta.token_ids[idx]
             token_mask = index_meta.token_mask[idx]
-            
+
             if token_mask is None:
                 valid_len = int(token_ids.numel())
             else:
                 valid_len = int(token_mask.sum())
-            
+
             slot_mapping = slot_mappings[idx]
-            slot_mapping = slot_mapping.contiguous()[:valid_len].to(device="cpu", dtype=torch.int64)
-            
+            slot_mapping = slot_mapping.contiguous()[:valid_len].to(
+                device="cpu", dtype=torch.int64
+            )
+
             task_id = self._client.put_async(
                 token_ids=index_meta.token_ids[idx],
                 token_mask=index_meta.token_mask[idx],
@@ -506,25 +468,67 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             handle=_FlexKVOffloadHandle(
                 task_ids=task_ids,
                 uids=index_meta.user_ids,
-                seqlens=index_meta.sequence_lengths,
+                seqlens=index_meta.seq_lengths,
             ),
             status=HostKVTaskStatus.LAUNCHED,
         )
 
+    # TODO(junyiq): Applies timeout when hostkv_wait_timeout_ms > 0.
     def offload_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         task_ids = task_handle.handle.task_ids
         user_ids = task_handle.handle.uids
-        wait_result = self._try_wait_offload_and_map_result(
-            task_ids=task_ids,
-            user_ids=user_ids,
-        )
-        return wait_result
 
-    def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
+        remain_task_ids = [t for t in task_ids if t not in task_handle.handle.responses]
+        responses = self._client.try_wait(remain_task_ids)
+
+        has_unready = False
+        # has_timeout = False
+        has_cancelled = False
+        has_failed = False
+        msgs: List[str] = []
+        for task_id, resp in responses.items():
+            task_handle.handle.responses[task_id] = resp
+            msgs.append(f"{task_id}:{resp.status}")
+            if resp.status == KVResponseStatus.SUCCESS:
+                continue
+            elif resp.status == KVResponseStatus.UNREADY:
+                has_unready = True
+            # if resp.status == KVResponseStatus.TIMEOUT:
+            #     has_timeout = True
+            elif resp.status == KVResponseStatus.CANCELLED:
+                has_cancelled = True
+            else:
+                has_failed = True
+        # if has_timeout:
+        #     return HostKVWaitResult(
+        #         status=HostKVTaskStatus.TIMEOUT,
+        #         ready=False,
+        #         message=";".join(msgs),
+        #         failed_user_ids=user_ids,
+        #     )
+        if has_failed or has_cancelled:
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.CANCELLED
+                if has_cancelled and not has_failed
+                else HostKVTaskStatus.FAILED,
+                ready=False,
+                message=";".join(msgs),
+                failed_user_ids=user_ids,
+            )
+        if has_unready:
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.LAUNCHED,
+                ready=False,
+                message=";".join(msgs),
+                failed_user_ids=user_ids,
+            )
+        return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
+
+    def finish_task(self, task_handle: HostKVTaskHandle) -> List[int]:
         # FlexKV wait success equals finish
         # TODO(junyiq): Make sure gpu kvcache locks the pages when offloading for flexkv backend.
         self._client.wait(task_handle.handle.task_ids, completely=True)
-        return True
+        return [1 for _ in range(task_handle.handle.uids.size(0))]
 
     def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
         if task_handle is None or task_handle.handle is None:

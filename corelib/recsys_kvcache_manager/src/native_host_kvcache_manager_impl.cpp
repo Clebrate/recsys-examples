@@ -241,16 +241,14 @@ HostKVStorageImpl::HostKVStorageImpl(
         offload_gpu_buffers.push_back(ptr);
     }
 
-    // std::cout << "[DEBUG] capacity_per_layer: " << capacity_per_layer << std::endl; 
     std::cout << "[INFO] Allocating pinned memory for host kvcache manager ..." << std::endl;
     for (int i = 0; i < num_layers; i++) {
-        std::cout << "[DEBUG]  -- layer " << i << " ..." <<  std::endl; 
+        std::cout << "[INFO]  -- layer " << i << ": " << (capacity_per_layer / 1024. / 1024. / 1024) <<     " GiB ..." <<  std::endl; 
         void *ptr;
         cudaCheck(cudaMallocHost(&ptr, capacity_per_layer));
         pinned_kvstorage_buffers.push_back(ptr);
     }
     std::cout << "[INFO] ... done." << std::endl;
-    // std::cout << "[DEBUG] total_pinned_bytes: " << (capacity_per_layer * num_layers) / 1024. / 1024. / 1024 << " GiB" << std::endl; 
 
     _num_empty_chunks = capacity_per_layer / unit_chunk_bytes;
     _empty_chunks.push(

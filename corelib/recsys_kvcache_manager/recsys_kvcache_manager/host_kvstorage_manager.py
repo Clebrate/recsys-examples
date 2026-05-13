@@ -102,7 +102,7 @@ class HostKVStorageManagerBase(ABC):
         ...
 
     @abstractmethod
-    def finish_task(self, task_handle: HostKVTaskHandle) -> bool:
+    def finish_task(self, task_handle: HostKVTaskHandle) -> List[int]:
         ...
 
     @abstractmethod
