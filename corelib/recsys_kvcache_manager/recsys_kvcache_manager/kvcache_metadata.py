@@ -41,6 +41,10 @@ class KVCacheMetadata:
     new_history_nnz: int = 0
     new_history_nnz_cuda: torch.Tensor = None  # 1
 
+    # attention kv seqlen & offsets
+    kv_seqlens: Optional[torch.Tensor] = None  # num_seq + 1
+    kv_seqlen_offsets: Optional[torch.Tensor] = None  # num_seq + 1
+
     # paged cache table pointers
     kv_cache_table: Optional[List[torch.Tensor]] = None
 
@@ -104,6 +108,9 @@ def get_kvcache_metadata_buffer(
         0, batch_size * 5 + 4 + num_new_tokens, num_new_tokens
     )
 
+    kv_seqlens = torch.empty_like(total_history_lengths)
+    kv_seqlen_offsets = torch.empty_like(total_history_offsets)
+
     return KVCacheMetadata(
         page_ids_gpu_buffer=page_ids_gpu_buffer,
         metadata_gpu_buffer=metadata_gpu_buffer,
@@ -117,6 +124,8 @@ def get_kvcache_metadata_buffer(
         position=position_buffer,
         new_history_nnz=num_new_tokens,
         new_history_nnz_cuda=new_history_nnz_cuda,
+        kv_seqlens=kv_seqlens,
+        kv_seqlen_offsets=kv_seqlen_offsets,
         kv_onload_handle=None,
     )
 
@@ -138,6 +147,8 @@ def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metata: KVCacheMeta
     copy_tensor(dst_metadata.new_history_nnz_cuda, src_metata.new_history_nnz_cuda)
     copy_offsets(dst_metadata.total_history_offsets, src_metata.total_history_offsets)
     copy_offsets(dst_metadata.new_history_offsets, src_metata.new_history_offsets)
+    copy_tensor(dst_metadata.kv_seqlens, src_metata.kv_seqlens)
+    copy_offsets(dst_metadata.kv_seqlen_offsets, src_metata.kv_seqlen_offsets)
 
     dst_metadata.new_history_nnz = src_metata.new_history_nnz
 

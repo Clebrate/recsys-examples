@@ -262,8 +262,9 @@ class HSTUBlockInference(torch.nn.Module):
         )
 
         if static_kvcache_metadata is not None:
-            static_kvcache_metadata.total_history_offsets += (
-                static_jagged_metadata.num_candidates_offsets
+            static_kvcache_metadata.kv_seqlen_offsets.copy_(
+                static_kvcache_metadata.total_history_offsets
+                + static_jagged_metadata.num_candidates_offsets
             )
             static_kvcache_metadata.new_history_nnz = num_tokens
 
@@ -325,10 +326,10 @@ class HSTUBlockInference(torch.nn.Module):
                 static_kvcache_metadata,
             )
 
-        if static_kvcache_metadata is not None:
-            static_kvcache_metadata.total_history_offsets -= (
-                static_jagged_metadata.num_candidates_offsets
-            )
+        # if static_kvcache_metadata is not None:
+        #     static_kvcache_metadata.total_history_offsets -= (
+        #         static_jagged_metadata.num_candidates_offsets
+        #     )
         print(
             "Capture cuda graphs for batch_size = {0} and num_tokens = {1}".format(
                 batch_size, num_tokens

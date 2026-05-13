@@ -308,7 +308,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 key,
                 value,
                 jd.seqlen_offsets[: batch_size + 1],
-                kv_cache_metadata.total_history_offsets[: batch_size + 1],
+                kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1],
                 None,
                 None,  # seqused_q, seqused_k
                 jd.max_seqlen,

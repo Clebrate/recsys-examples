@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 from typing import Any, Dict, Optional, Tuple, Union
 
-import paged_kvcache_ops
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
 from commons.ops.triton_ops.common import (
@@ -213,6 +213,7 @@ class InferenceDenseModule(torch.nn.Module):
         self._use_kvcache = False
         if kvcache_config is not None:
             self._use_kvcache = True
+            self.kvcache_config = kvcache_config
             self.kvcache = KVCacheManager.from_config(kvcache_config)
 
     def setup_for_cudagraph(
@@ -221,18 +222,25 @@ class InferenceDenseModule(torch.nn.Module):
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
+            max_batch_size = hstu_config.max_batch_size
+            max_num_pages = math.ceil(
+                hstu_config.max_seq_len / kvcache_config.page_size
+            )
+            max_num_pages *= max_batch_size
+            max_num_tokens = hstu_config.max_seq_len * max_batch_size
             self._kvcache_metadata = None
             if self._use_kvcache:
                 self._kvcache_metadata = get_kvcache_metadata_buffer(
-                    hstu_config, kvcache_config
+                    batch_size=max_batch_size,
+                    num_new_tokens=max_num_tokens,
+                    num_pages=max_num_pages,
+                    device=torch.cuda.current_device(),
                 )
-                self._kvcache_metadata.kv_cache_table = (
-                    self.kvcache.gpu_kvcache_mgr.gpu_kvcache_table[idx]
-                    for idx in range(self.num_layers)
-                )
-                self._kvcache_metadata.kv_onload_handle = (
-                    paged_kvcache_ops.KVOnloadHandle(self.num_layers)
-                )
+                self._kvcache_metadata.kv_cache_table = [
+                    self.kvcache.gpu_kvcache_mgr.gpu_kvcache_tables[idx]
+                    for idx in range(hstu_config.num_layers)
+                ]
+                self._kvcache_metadata.kv_onload_handle = None
             self._hstu_block.set_cudagraph(
                 hstu_config.max_batch_size,
                 hstu_config.max_seq_len,

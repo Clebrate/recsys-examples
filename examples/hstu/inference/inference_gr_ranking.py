@@ -162,7 +162,11 @@ def get_inference_hstu_model(
     )
 
     host_capacity_per_layer = (
-        10240 * 2 * 32 * (network_args.num_attention_heads * network_args.kv_channels)
+        10240
+        * 2
+        * 32
+        * (network_args.num_attention_heads * network_args.kv_channels)
+        * 2
     )
     kvcache_args = {
         "num_layers": network_args.num_layers,

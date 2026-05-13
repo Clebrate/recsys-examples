@@ -8,9 +8,10 @@ ARG TRITONSERVER_BUILD
 WORKDIR /workspace/deps
 
 # -- Layer 1: system setup, arch symlinks, tritonserver deps ---
-RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
+RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash-dev && \
+    if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       ln /bin/python3 /bin/python && \
-      apt-get update -y --fix-missing && apt-get install -y cmake patchelf && \
+      apt-get install -y cmake patchelf liburing-dev libxxhash-dev && \
       pip3 install pandas rich cloudpickle psutil && \
       pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130; \
     fi && \
@@ -37,7 +38,7 @@ RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
 # -- Layer 2: pip dependencies + Megatron-LM ---
 RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
-    pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers \
+    pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
     cloudpickle triton==3.6.0 nvidia-cutlass-dsl==4.3.0 --no-cache pre-commit
 
 # -- Layer 3: FBGEMM (long build, own layer for caching) ---
@@ -52,9 +53,22 @@ RUN pip install --no-deps tensordict orjson && \
     cd torchrec && \
     pip install --no-deps .
 
-RUN git clone -b arbitrary_mask https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
+# -- Layer 5: FlashAttention --
+ARG FLASH_ATTN_ARBITRARY_MASK_COMMIT=b56db721d65afadd8cfe154cd12e83693bf0aba3
+RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
     cd flash-attention && \
-    pip install --no-deps -e .
+    git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
+    pip install --no-deps --no-build-isolation -e ./flash_attn/cute
+
+# -- Layer 6: FlexKV --
+RUN git clone --recursive https://github.com/taco-project/FlexKV.git FlexKV && \
+    cd FlexKV && git submodule update --init --recursive && \
+    mkdir -p build && cd build && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake .. && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" cmake --build . -j8 && \
+    cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
+    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install && \
+    cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && cd -
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
