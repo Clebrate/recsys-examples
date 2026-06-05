@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass
@@ -109,6 +111,19 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         num_cpu_blocks: int = 4096,
         num_local_blocks: int = 4096,
         num_tmp_cpu_blocks: int = 256,
+        ssd_cache_gb: float = 0.0,
+        ssd_cache_dir: Optional[str] = None,
+        enable_gds: bool = False,
+        enable_p2p_cpu: bool = False,
+        enable_p2p_ssd: bool = False,
+        redis_host: str = "127.0.0.1",
+        redis_port: int = 6379,
+        local_ip: str = "127.0.0.1",
+        redis_password: Optional[str] = None,
+        node_ttl_seconds: int = 30,
+        local_zmq_ip: str = "127.0.0.1",
+        local_zmq_port: int = 5555,
+        mooncake_config_path: Optional[str] = None,
         dtype: torch.dtype = torch.bfloat16,
         enable_mps: bool = False,
         hostkv_wait_timeout_ms: int = 0,
@@ -124,6 +139,19 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self.num_cpu_blocks = int(num_cpu_blocks)
         self.num_local_blocks = int(num_local_blocks)
         self.num_tmp_cpu_blocks = int(num_tmp_cpu_blocks)
+        self.ssd_cache_gb = float(ssd_cache_gb)
+        self.ssd_cache_dir = ssd_cache_dir
+        self.enable_gds = bool(enable_gds)
+        self.enable_p2p_cpu = bool(enable_p2p_cpu)
+        self.enable_p2p_ssd = bool(enable_p2p_ssd)
+        self.redis_host = redis_host
+        self.redis_port = int(redis_port)
+        self.local_ip = local_ip
+        self.redis_password = redis_password
+        self.node_ttl_seconds = int(node_ttl_seconds)
+        self.local_zmq_ip = local_zmq_ip
+        self.local_zmq_port = int(local_zmq_port)
+        self.mooncake_config_path = mooncake_config_path
         self.dtype = dtype
         self.hostkv_wait_timeout_ms = int(hostkv_wait_timeout_ms)
         self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
@@ -181,6 +209,30 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 time.sleep(0.05)
         self._ready = True
 
+    def _resolve_mooncake_config_path(self) -> str:
+        if self.mooncake_config_path:
+            return self.mooncake_config_path
+        env_path = os.getenv("MOONCAKE_CONFIG_PATH")
+        if env_path:
+            return env_path
+
+        mooncake_config = {
+            "engine_ip": self.local_ip,
+            "engine_port": self.local_zmq_port,
+            "metadata_backend": "redis",
+            "metadata_server": f"redis://{self.redis_host}:{self.redis_port}",
+            "metadata_server_auth": self.redis_password or "",
+            "protocol": "tcp",
+            "device_name": "",
+        }
+        mooncake_config_fd, mooncake_config_path = tempfile.mkstemp(
+            suffix=".json",
+            prefix="flexkv_mooncake_config_",
+        )
+        with os.fdopen(mooncake_config_fd, "w") as config_file:
+            json.dump(mooncake_config, config_file, indent=2)
+        return mooncake_config_path
+
     def _init_client(self) -> None:
         if self._client is not None:
             return
@@ -207,6 +259,42 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             cache_cfg_kwargs["num_local_blocks"] = self.num_local_blocks
         if self.num_tmp_cpu_blocks > 0:
             cache_cfg_kwargs["num_tmp_cpu_blocks"] = self.num_tmp_cpu_blocks
+
+        enable_kv_sharing = self.enable_p2p_cpu or self.enable_p2p_ssd
+        if enable_kv_sharing and self.enable_gds:
+            raise ValueError(
+                "flexkv enable_gds and p2p sharing cannot be used together"
+            )
+        if self.enable_p2p_ssd and self.ssd_cache_gb <= 0:
+            raise ValueError("flexkv_enable_p2p_ssd requires flexkv_ssd_cache_gb > 0")
+
+        if self.ssd_cache_gb > 0:
+            block_size_bytes = model_cfg.token_size_in_bytes * self.page_size
+            cache_cfg_kwargs["enable_ssd"] = True
+            cache_cfg_kwargs["num_ssd_blocks"] = int(
+                self.ssd_cache_gb * (1024**3) / block_size_bytes
+            )
+            cache_cfg_kwargs["ssd_cache_dir"] = (
+                self.ssd_cache_dir or os.getenv("FLEXKV_SSD_CACHE_DIR", "./flexkv_ssd")
+            )
+            cache_cfg_kwargs["enable_gds"] = self.enable_gds
+        elif self.enable_gds:
+            raise ValueError("flexkv_enable_gds requires flexkv_ssd_cache_gb > 0")
+
+        if self.enable_p2p_cpu:
+            cache_cfg_kwargs["enable_p2p_cpu"] = True
+        if self.enable_p2p_ssd:
+            cache_cfg_kwargs["enable_p2p_ssd"] = True
+        if enable_kv_sharing:
+            cache_cfg_kwargs["redis_host"] = self.redis_host
+            cache_cfg_kwargs["redis_port"] = self.redis_port
+            cache_cfg_kwargs["local_ip"] = self.local_ip
+            cache_cfg_kwargs["redis_password"] = self.redis_password
+            cache_cfg_kwargs["node_ttl_seconds"] = self.node_ttl_seconds
+            cache_cfg_kwargs["local_zmq_ip"] = self.local_zmq_ip
+            cache_cfg_kwargs["local_zmq_port"] = self.local_zmq_port
+            cache_cfg_kwargs["mooncake_config_path"] = self._resolve_mooncake_config_path()
+
         cache_cfg = CacheConfig(**cache_cfg_kwargs)
         self._client = KVManager(
             model_config=model_cfg,

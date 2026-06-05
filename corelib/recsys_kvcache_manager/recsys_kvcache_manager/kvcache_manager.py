@@ -314,6 +314,46 @@ class KVCacheManager:
             flexkv_num_cpu_blocks = int(extra.get("flexkv_num_cpu_blocks", 4096))
             flexkv_num_local_blocks = int(extra.get("flexkv_num_local_blocks", 4096))
             flexkv_num_tmp_cpu_blocks = int(extra.get("flexkv_num_tmp_cpu_blocks", 256))
+            flexkv_ssd_cache_gb = float(extra.get("flexkv_ssd_cache_gb", 0))
+            flexkv_ssd_cache_dir = extra.get("flexkv_ssd_cache_dir", None)
+            flexkv_enable_gds_raw = extra.get("flexkv_enable_gds", 0)
+            if isinstance(flexkv_enable_gds_raw, str):
+                flexkv_enable_gds = flexkv_enable_gds_raw.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            else:
+                flexkv_enable_gds = bool(flexkv_enable_gds_raw)
+            flexkv_enable_p2p_cpu_raw = extra.get("flexkv_enable_p2p_cpu", 0)
+            if isinstance(flexkv_enable_p2p_cpu_raw, str):
+                flexkv_enable_p2p_cpu = flexkv_enable_p2p_cpu_raw.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            else:
+                flexkv_enable_p2p_cpu = bool(flexkv_enable_p2p_cpu_raw)
+            flexkv_enable_p2p_ssd_raw = extra.get("flexkv_enable_p2p_ssd", 0)
+            if isinstance(flexkv_enable_p2p_ssd_raw, str):
+                flexkv_enable_p2p_ssd = flexkv_enable_p2p_ssd_raw.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            else:
+                flexkv_enable_p2p_ssd = bool(flexkv_enable_p2p_ssd_raw)
+            flexkv_redis_host = extra.get("flexkv_redis_host", "127.0.0.1")
+            flexkv_redis_port = int(extra.get("flexkv_redis_port", 6379))
+            flexkv_local_ip = extra.get("flexkv_local_ip", "127.0.0.1")
+            flexkv_redis_password = extra.get("flexkv_redis_password", None)
+            flexkv_node_ttl_seconds = int(extra.get("flexkv_node_ttl_seconds", 30))
+            flexkv_local_zmq_ip = extra.get("flexkv_local_zmq_ip", flexkv_local_ip)
+            flexkv_local_zmq_port = int(extra.get("flexkv_local_zmq_port", 5555))
+            flexkv_mooncake_config_path = extra.get("flexkv_mooncake_config_path", None)
             flexkv_host_kvstorage_fail_policy = str(
                 extra.get("flexkv_host_kvstorage_fail_policy", "fail_close")
             )
@@ -339,6 +379,19 @@ class KVCacheManager:
                 num_cpu_blocks=flexkv_num_cpu_blocks,
                 num_local_blocks=flexkv_num_local_blocks,
                 num_tmp_cpu_blocks=flexkv_num_tmp_cpu_blocks,
+                ssd_cache_gb=flexkv_ssd_cache_gb,
+                ssd_cache_dir=flexkv_ssd_cache_dir,
+                enable_gds=flexkv_enable_gds,
+                enable_p2p_cpu=flexkv_enable_p2p_cpu,
+                enable_p2p_ssd=flexkv_enable_p2p_ssd,
+                redis_host=flexkv_redis_host,
+                redis_port=flexkv_redis_port,
+                local_ip=flexkv_local_ip,
+                redis_password=flexkv_redis_password,
+                node_ttl_seconds=flexkv_node_ttl_seconds,
+                local_zmq_ip=flexkv_local_zmq_ip,
+                local_zmq_port=flexkv_local_zmq_port,
+                mooncake_config_path=flexkv_mooncake_config_path,
                 dtype=kvcache_config.dtype,
                 enable_mps=flexkv_enable_mps,
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
