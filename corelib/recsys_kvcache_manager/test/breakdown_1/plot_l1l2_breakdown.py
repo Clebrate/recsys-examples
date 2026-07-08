@@ -4,7 +4,7 @@
 The inner ring is the L1 step-op percentage of total time. The outer ring is
 the L2 function percentage of total time inside each corresponding L1 sector.
 If the labeled L2 functions do not add up to the L1 time, the remainder is
-shown as an unlabeled "unattributed" segment so the geometry stays correct.
+shown as an "other overhead" segment so the geometry stays correct.
 """
 
 import math
@@ -98,7 +98,7 @@ def add_unattributed(
     child_total = sum(value for _, value in children)
     remainder = max(l1_value - child_total, 0.0)
     if remainder > 1e-9:
-        return children + [("unattributed", remainder)]
+        return children + [("other overhead", remainder)]
     return children
 
 
@@ -159,7 +159,7 @@ def draw() -> None:
             child_span = child_value / l1_value * span if l1_value > 0 else 0.0
             child_theta1 = child_cursor - child_span
             child_theta2 = child_cursor
-            is_unattributed = child_name == "unattributed"
+            is_other_overhead = child_name == "other overhead"
 
             ax.add_patch(
                 Wedge(
@@ -171,22 +171,28 @@ def draw() -> None:
                     facecolor=color,
                     edgecolor="white",
                     linewidth=1.0,
-                    alpha=0.30 if is_unattributed else 0.92,
+                    alpha=0.38 if is_other_overhead else 0.92,
                 )
             )
 
-            if not is_unattributed and child_value / total >= 0.00015:
+            min_label_ratio = 0.005 if is_other_overhead else 0.00015
+            if child_value / total >= min_label_ratio:
                 child_mid = (child_theta1 + child_theta2) / 2.0
                 anchor = polar_point(child_mid, outer_radius - outer_width / 2.0)
                 label_x, label_y = polar_point(child_mid, outer_radius + 0.16)
                 side = 1 if label_x >= 0 else -1
+                label_name = (
+                    f"{group_name} other overhead"
+                    if is_other_overhead
+                    else child_name
+                )
                 callouts.append(
                     {
                         "anchor": anchor,
                         "x": label_x,
                         "y": label_y,
                         "side": side,
-                        "label": f"{child_name} {pct(child_value, total)}",
+                        "label": f"{label_name} {pct(child_value, total)}",
                         "color": color,
                     }
                 )
@@ -215,7 +221,7 @@ def draw() -> None:
             xytext=(callout["x"], callout["y"]),
             ha="left" if callout["side"] > 0 else "right",
             va="center",
-                fontsize=5.6,
+            fontsize=5.6,
             arrowprops=dict(arrowstyle="-", color=callout["color"], lw=0.7),
             bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.78),
         )
