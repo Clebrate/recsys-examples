@@ -1,0 +1,8 @@
+# SSD-hit: CPU needs headroom for D2H PUT; SSD > CPU for spill.
+cpu_cache_gb: 32.0
+ssd_cache_gb: 200.0
+ssd_cache_dir: /tmp/nvidia-mp/flexkv_pr429_ssd_cache
+enable_gds: false
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+enable_3rd_remote: false

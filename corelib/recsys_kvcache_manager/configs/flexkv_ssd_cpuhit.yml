@@ -1,0 +1,8 @@
+# GPU-hit / CPU-hit scenarios: keep prefixes in CPU (not SSD).
+cpu_cache_gb: 32.0
+ssd_cache_gb: 64.0
+ssd_cache_dir: /tmp/nvidia-mp/flexkv_pr429_ssd_cache
+enable_gds: false
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+enable_3rd_remote: false

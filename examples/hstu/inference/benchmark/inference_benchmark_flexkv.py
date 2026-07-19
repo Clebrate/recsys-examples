@@ -25,7 +25,8 @@ ITEM_FEATURE_NAME = "item_feat"
 ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
-SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
+SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit", "no_cache"})
+KVCACHE_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
 
 
 InferenceRequest = Tuple[HSTUBatch, torch.Tensor, torch.Tensor]
@@ -64,7 +65,7 @@ def parse_scenarios(scenarios_arg: str) -> set[str]:
         if scenario not in SUPPORTED_SCENARIOS:
             raise ValueError(
                 f"Unsupported scenario '{scenario}'. "
-                "Use gpu_hit,cpu_hit,ssd_hit."
+                "Use gpu_hit,cpu_hit,ssd_hit,no_cache."
             )
         scenarios.add(scenario)
     return scenarios
@@ -145,7 +146,7 @@ def build_request(
     )
 
 
-def build_model(cfg: BenchmarkConfig, history_len: int):
+def build_model(cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = True):
     max_num_history = max(2048, history_len + cfg.append_history_len)
     max_num_candidates = cfg.num_candidates
     max_seqlen = max_num_history * 2 + max_num_candidates
@@ -178,35 +179,37 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
         num_primary_cache_pages * 2 * page_size * (num_heads * head_dim) * 2
     )
 
-    extra_configs = {
-        "flexkv_mode": "direct",
-        "flexkv_host_kvstorage_fail_policy": "fail_open",
-        "flexkv_enable_mps": 0,
-        "flexkv_as_batch": 1,
-        "flexkv_num_cpu_blocks": int(cfg.flexkv_num_cpu_blocks),
-        "flexkv_num_local_blocks": int(cfg.flexkv_num_local_blocks),
-    }
-    if cfg.flexkv_config_path:
-        extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
+    kv_cache_config = None
+    if enable_kvcache:
+        extra_configs = {
+            "flexkv_mode": "direct",
+            "flexkv_host_kvstorage_fail_policy": "fail_open",
+            "flexkv_enable_mps": 0,
+            "flexkv_as_batch": 1,
+            "flexkv_num_cpu_blocks": int(cfg.flexkv_num_cpu_blocks),
+            "flexkv_num_local_blocks": int(cfg.flexkv_num_local_blocks),
+        }
+        if cfg.flexkv_config_path:
+            extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
 
-    kv_cache_config = get_kvcache_config(
-        num_layers=num_layers,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        offload_chunksize=offload_chunksize,
-        num_primary_cache_pages=num_primary_cache_pages,
-        num_buffer_pages=0,
-        host_capacity_per_layer=host_capacity_per_layer,
-        max_batch_size=cfg.max_batch_size,
-        max_seq_len=math.ceil(max_seqlen / page_size) * page_size,
-        dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
-        host_kvstorage_backend="flexkv",
-        offload_timeout_ms=100.0,
-        offload_mode="lazy",
-        extra_configs=extra_configs,
-    )
+        kv_cache_config = get_kvcache_config(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            offload_chunksize=offload_chunksize,
+            num_primary_cache_pages=num_primary_cache_pages,
+            num_buffer_pages=0,
+            host_capacity_per_layer=host_capacity_per_layer,
+            max_batch_size=cfg.max_batch_size,
+            max_seq_len=math.ceil(max_seqlen / page_size) * page_size,
+            dtype=torch.bfloat16,
+            device=torch.cuda.current_device(),
+            host_kvstorage_backend="flexkv",
+            offload_timeout_ms=100.0,
+            offload_mode="lazy",
+            extra_configs=extra_configs,
+        )
 
     emb_configs = [
         InferenceEmbeddingConfig(
@@ -324,6 +327,46 @@ def run_scenario_gpu_hit(
     finally:
         torch.cuda.nvtx.range_pop()
     print(f"[Scenario1] timed run completed, iters={timed_iters}")
+
+
+def run_scenario_no_cache(
+    model_predict,
+    history_len: int,
+    append_history_len: int,
+    num_candidates: int,
+    max_seqlen: int,
+    warmup_iters: int,
+    timed_iters: int,
+    batch_size: int,
+) -> None:
+    base_user_id = 40
+    timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
+    timed_history_len = get_timed_history_len(history_len, append_history_len)
+    req_timed = [
+        build_request(user_ids, timed_history_len, num_candidates, max_seqlen)
+        for user_ids in timed_user_batches
+    ]
+    attention_kv_tokens = timed_history_len * 2 + num_candidates
+    mode = "only_onboard" if BENCHMARK_CONFIG.only_onboard else "end_to_end"
+    print(
+        f"[NoCache] mode={mode}, attention_kv_tokens={attention_kv_tokens} "
+        f"(history={timed_history_len * 2}, candidates={num_candidates})"
+    )
+
+    print("warmup")
+    torch.cuda.nvtx.range_push("no_cache.warmup")
+    try:
+        for batch, _, _ in req_timed[:warmup_iters]:
+            model_predict.forward_nokvcache(batch)
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+    print("timed run")
+    for iter_idx, (batch, _, _) in enumerate(req_timed):
+        torch.cuda.nvtx.range_push(f"no_cache_timed_run_{iter_idx}")
+        model_predict.forward_nokvcache(batch)
+        torch.cuda.nvtx.range_pop()
+    print(f"[NoCache] timed run completed, iters={timed_iters}")
 
 
 def run_scenario_gpu_miss_host_hit(
@@ -625,6 +668,7 @@ def shutdown_flexkv_client(model_predict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timed-iters", type=int, default=None)
+    parser.add_argument("--history-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--append-history-len", type=int, default=None)
     parser.add_argument("--ssd-pressure-users", type=int, default=None)
@@ -635,7 +679,7 @@ if __name__ == "__main__":
         "--scenarios",
         type=str,
         default="gpu_hit,cpu_hit,ssd_hit",
-        help="Comma-separated scenarios to run: gpu_hit,cpu_hit,ssd_hit.",
+        help="Comma-separated scenarios to run: gpu_hit,cpu_hit,ssd_hit,no_cache.",
     )
     parser.add_argument(
         "--only-onboard",
@@ -654,6 +698,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, flexkv_config_path=flexkv_config_path)
     if args.timed_iters is not None:
         cfg = replace(cfg, timed_iters=args.timed_iters)
+    if args.history_len is not None:
+        cfg = replace(cfg, history_len=args.history_len)
     if args.batch_size is not None:
         cfg = replace(cfg, batch_size=args.batch_size)
     if args.append_history_len is not None:
@@ -687,7 +733,12 @@ if __name__ == "__main__":
 
     history_len = cfg.history_len
     scenarios = parse_scenarios(args.scenarios)
+    if "no_cache" in scenarios and scenarios & KVCACHE_SCENARIOS:
+        raise ValueError(
+            "no_cache cannot be combined with gpu_hit/cpu_hit/ssd_hit. Run separately."
+        )
     mode = "only_onboard" if cfg.only_onboard else "end_to_end"
+    enable_kvcache = scenarios != {"no_cache"}
     print(
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
@@ -695,11 +746,24 @@ if __name__ == "__main__":
         f"mode={mode}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )
-    model_predict, page_size, max_seqlen = build_model(cfg, history_len)
+    model_predict, page_size, max_seqlen = build_model(
+        cfg, history_len, enable_kvcache=enable_kvcache
+    )
     print(f"[Config] page_size={page_size}, max_seqlen={max_seqlen}")
 
     try:
         with torch.inference_mode():
+            if "no_cache" in scenarios:
+                run_scenario_no_cache(
+                    model_predict=model_predict,
+                    history_len=history_len,
+                    append_history_len=cfg.append_history_len,
+                    num_candidates=cfg.num_candidates,
+                    max_seqlen=max_seqlen,
+                    warmup_iters=cfg.warmup_iters,
+                    timed_iters=cfg.timed_iters,
+                    batch_size=cfg.batch_size,
+                )
             if "gpu_hit" in scenarios:
                 run_scenario_gpu_hit(
                     model_predict=model_predict,
