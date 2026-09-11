@@ -7,7 +7,7 @@
 	branch = recsys-examples-dev
 [submodule "third_party/FlexKV"]
 	path = third_party/FlexKV
-	url = https://github.com/taco-project/FlexKV.git
+	url = https://github.com/Clebrate/FlexKV.git
 [submodule "third_party/nv-embedding-cache"]
 	path = third_party/nv-embedding-cache
 	url = https://github.com/NVIDIA/nv-embedding-cache.git

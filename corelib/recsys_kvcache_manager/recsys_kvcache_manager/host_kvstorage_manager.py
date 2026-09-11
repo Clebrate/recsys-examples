@@ -22,6 +22,7 @@ import torch
 
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
+from .layer_ready_plan import LayerReadyPlan
 
 
 class HostKVTaskStatus(Enum):
@@ -59,6 +60,8 @@ class HostKVTaskHandle:
     time_launched: Optional[float] = None
     is_layerwise: bool = False
     onboard_wait_by_layer: Optional[Any] = None
+    plan: Optional[LayerReadyPlan] = None
+    gpu_ready_events: Optional[List[Any]] = None
 
     def __post_init__(self):
         if self.status not in {
@@ -72,14 +75,40 @@ class HostKVTaskHandle:
                 self.handle is not None
             ), "underlying handle must be provided for initialized tasks"
 
-    def stream_wait_layer(self, layer_idx: int) -> None:
+    def needs_whole_onboard_wait(self) -> bool:
+        """True when compute must wait the whole GET before any HSTU layer.
+
+        Prefers ``plan.ready`` when present; otherwise matches PR 428
+        (FlexKV naive = whole wait, layerwise / Native = per-layer wait).
+        """
+        if self.handle is None or self.status == HostKVTaskStatus.SKIPPED:
+            return False
+        if self.plan is not None:
+            return self.plan.is_whole_cache_wait()
+        return self.backend == "flexkv" and not self.is_layerwise
+
+    def stream_wait_layer(
+        self,
+        layer_idx: int,
+        stream: Optional["torch.cuda.Stream"] = None,
+    ) -> None:
+        if not self.is_layerwise and self.gpu_ready_events is None:
+            return
+        if self.gpu_ready_events is not None:
+            event = self.gpu_ready_events[layer_idx]
+            wait_stream = stream if stream is not None else torch.cuda.current_stream()
+            if hasattr(event, "wait_stream"):
+                event.wait_stream(wait_stream)
+            else:
+                wait_stream.wait_event(event)
+            return
         if self.is_layerwise:
             self.handle.wait_layer(layer_idx)
 
-    def wait_layer(self, layer_idx: int):
+    def wait_layer(self, layer_idx: int, stream: Optional["torch.cuda.Stream"] = None):
         if self.onboard_wait_by_layer is not None:
             return self.onboard_wait_by_layer(self, layer_idx)
-        self.stream_wait_layer(layer_idx)
+        self.stream_wait_layer(layer_idx, stream=stream)
 
 
 @dataclass

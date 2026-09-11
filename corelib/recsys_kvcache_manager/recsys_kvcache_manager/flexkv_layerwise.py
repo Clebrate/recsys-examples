@@ -22,10 +22,34 @@ import threading
 import time
 from array import array
 from ctypes import CDLL, get_errno
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 
 DEFAULT_LAYERWISE_EVENTFD_SOCKET = "/tmp/flexkv_layerwise_eventfd.sock"
+LAYER_READY_IPC_MAGIC = 0x43564554
+
+
+def _recvall(sock: socket.socket, num_bytes: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < num_bytes:
+        piece = sock.recv(num_bytes - len(chunks))
+        if not piece:
+            raise RuntimeError(
+                f"Socket closed after {len(chunks)}/{num_bytes} bytes"
+            )
+        chunks.extend(piece)
+    return bytes(chunks)
+
+
+class GpuReadyEvent:
+    """CUDA IPC event imported in the Recsys process for ``stream.wait_event``."""
+
+    def __init__(self, impl: Any) -> None:
+        self._impl = impl
+
+    def wait_stream(self, stream: Any) -> None:
+        stream_ptr = int(stream.cuda_stream)
+        self._impl.wait_stream(stream_ptr)
 
 
 def create_layerwise_eventfd_socket_path() -> str:
@@ -54,6 +78,9 @@ class FlexKVLayerwiseEventfdSender:
         self._thread: Optional[threading.Thread] = None
         self._handoff_done = threading.Event()
         self._handoff_error: Optional[BaseException] = None
+        self._ipc_blob: bytes = b""
+        self._ipc_shape: Optional[Tuple[int, int, int, int]] = None
+        self._gpu_ready_by_counter: Optional[List[List[GpuReadyEvent]]] = None
 
     @staticmethod
     def _create_eventfd() -> int:
@@ -105,6 +132,55 @@ class FlexKVLayerwiseEventfdSender:
             raise RuntimeError(
                 "FlexKV layerwise eventfd handoff failed"
             ) from self._handoff_error
+
+    def import_gpu_ready_events(self, device: int, gpu_index: int = 0) -> None:
+        """Open CUDA IPC handles in this process. Safe to call more than once."""
+        if self._gpu_ready_by_counter is not None:
+            return
+        if not self._ipc_blob or self._ipc_shape is None:
+            return
+        counters, layers, gpus, handle_size = self._ipc_shape
+        if counters <= 0 or layers <= 0 or gpus <= 0 or handle_size <= 0:
+            return
+        try:
+            from flexkv.c_ext import ImportedCudaEvent
+        except Exception:
+            return
+        gpu_index = min(max(int(gpu_index), 0), gpus - 1)
+        events: List[List[GpuReadyEvent]] = []
+        offset = 0
+        blob = self._ipc_blob
+        for _counter in range(counters):
+            layer_events: List[GpuReadyEvent] = []
+            for _layer in range(layers):
+                chosen: Optional[GpuReadyEvent] = None
+                for gpu in range(gpus):
+                    handle = blob[offset : offset + handle_size]
+                    offset += handle_size
+                    if gpu == gpu_index:
+                        chosen = GpuReadyEvent(
+                            ImportedCudaEvent(handle, int(device))
+                        )
+                if chosen is None:
+                    raise RuntimeError(
+                        "Failed to import layer-ready CUDA event for "
+                        f"gpu_index={gpu_index}"
+                    )
+                layer_events.append(chosen)
+            events.append(layer_events)
+        self._gpu_ready_by_counter = events
+
+    def layer_gpu_ready_events(
+        self, counter_id: int
+    ) -> Optional[List[GpuReadyEvent]]:
+        if self._gpu_ready_by_counter is None:
+            return None
+        if counter_id < 0 or counter_id >= len(self._gpu_ready_by_counter):
+            raise ValueError(
+                f"Invalid layerwise counter_id={counter_id}, "
+                f"expected [0, {len(self._gpu_ready_by_counter)})"
+            )
+        return self._gpu_ready_by_counter[counter_id]
 
     def _run_sender(self) -> None:
         try:
@@ -194,6 +270,18 @@ class FlexKVLayerwiseEventfdSender:
                     raise RuntimeError(
                         f"FlexKV layerwise eventfd receiver returned ack={ack!r}"
                     )
+                sock.settimeout(max(deadline - time.time(), 30.0))
+                header = _recvall(sock, 20)
+                magic, counters, layers, gpus, handle_size = struct.unpack(
+                    "<iiiii", header
+                )
+                if magic != LAYER_READY_IPC_MAGIC:
+                    raise RuntimeError(
+                        f"Unexpected layer-ready IPC magic {magic:#x}"
+                    )
+                nbytes = counters * layers * gpus * handle_size
+                self._ipc_blob = _recvall(sock, nbytes) if nbytes > 0 else b""
+                self._ipc_shape = (counters, layers, gpus, handle_size)
                 return
             except (OSError, RuntimeError) as e:
                 last_error = e

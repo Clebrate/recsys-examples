@@ -367,8 +367,7 @@ class InferenceDenseModule(torch.nn.Module):
                 onboard_handle is not None
                 and onboard_handle.handle is not None
                 and onboard_handle.status != HostKVTaskStatus.SKIPPED
-                and onboard_handle.backend == "flexkv"
-                and not onboard_handle.is_layerwise
+                and onboard_handle.needs_whole_onboard_wait()
             ):
                 torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
                 try:

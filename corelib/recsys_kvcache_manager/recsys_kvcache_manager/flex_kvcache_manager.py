@@ -44,6 +44,7 @@ from .host_kvstorage_manager import (
 )
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
+from .layer_ready_plan import default_onboard_plan
 
 
 @dataclass
@@ -221,6 +222,7 @@ class FlexKVStorage(HostKVStorageBase):
         )
         if self.enable_layerwise and self._layerwise_eventfd_sender is not None:
             self._layerwise_eventfd_sender.wait_until_ready()
+            self._layerwise_eventfd_sender.import_gpu_ready_events(device_id)
         self._registered = True
 
         # Client becomes operational only after transfer manager is ready.
@@ -459,11 +461,16 @@ class FlexKVStorage(HostKVStorageBase):
 
             # TODO(junyiq): Add optimization to onboard partial. For now on all cases, we onboard the full sequence.
 
+        onboard_plan = default_onboard_plan(
+            num_layers=self.num_layers,
+            layerwise=bool(self.enable_layerwise),
+        )
         if len(onboard_task_ids) == 0:
             return HostKVTaskHandle(
                 backend="flexkv",
                 handle=None,
                 status=HostKVTaskStatus.SKIPPED,
+                plan=onboard_plan,
             )
 
         onload_handle = _FlexKVOnloadHandle(
@@ -481,7 +488,16 @@ class FlexKVStorage(HostKVStorageBase):
             user_ids=onload_handle.uids,
             handle=onload_handle,
             status=HostKVTaskStatus.LAUNCHED,
-            is_layerwise=bool(self.enable_layerwise),
+            is_layerwise=onboard_plan.ready == "layerwise",
+            plan=onboard_plan,
+            gpu_ready_events=(
+                self._layerwise_eventfd_sender.layer_gpu_ready_events(
+                    self.layerwise_counter_id
+                )
+                if self.enable_layerwise
+                and self._layerwise_eventfd_sender is not None
+                else None
+            ),
             metadata={
                 "onboard_start_indices": torch.tensor(
                     onboard_start_indices, dtype=torch.int32
