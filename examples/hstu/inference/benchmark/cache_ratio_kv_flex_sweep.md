@@ -65,13 +65,13 @@ GPU 是 RTX PRO 6000 Blackwell Server Edition，显存 GDDR7。
 每一层对 t 个历史 token 做 uvqk 投影和输出投影，再做因果 attention。uvqk 把 d_h 投到 4Hd，输出投影把 Hd 投回 d_h，乘加各计 2 次。因果 attention 的 query-key 对有 t(t+1)/2 个，QK 和 AV 各是长度 d 的乘加，再乘 head 数，因此 FLOPS：
 
 $$
-F_{\mathrm{hist}}=N\Big(10\,t\,d_h\,H\,d+2\,H\,d\,t(t+1)\Big)
+F_{\mathrm{hist}}=N\Big(10 t d_h H d+2 H d t(t+1)\Big)
 $$
 
 Bytes:
 
 $$
-b_{\mathrm{layer}}=2\big(5Hd\,d_h+2t\,d_h+5t\,Hd\big)
+b_{\mathrm{layer}}=2\big(5 Hd d_h+2 t d_h+5 t Hd\big)
 $$
 
 
@@ -134,7 +134,7 @@ $$
 一条请求的历史要么整段在 cache 里，要么整段重算。请求命中率是 h，则
 
 $$
-L_{\mathrm{kv}}(h)=h\,L_{\mathrm{kv}}+(1-h)\,L^{\mathrm{miss}}_{\mathrm{kv}}
+L_{\mathrm{kv}}(h)=hL_{\mathrm{kv}}+(1-h)L^{\mathrm{miss}}_{\mathrm{kv}}
 $$
 
 
@@ -144,7 +144,7 @@ $$
 Lkv 取上一节的合计：
 
 $$
-L_{\mathrm{kv,CPU}}(h)=0.060+0.148\,h\ \mathrm{ms}
+L_{\mathrm{kv,CPU}}(h)=0.060+0.148h\ \mathrm{ms}
 $$
 
 
@@ -152,7 +152,7 @@ $$
 ##### b. 在 GPU 中命中
 
 $$
-L_{\mathrm{kv,GPU}}(h)=0.060-0.052\,h\ \mathrm{ms}
+L_{\mathrm{kv,GPU}}(h)=0.060-0.052h\ \mathrm{ms}
 $$
 
 
@@ -171,19 +171,19 @@ $$
 第 $t$ 条请求要查的 id 个数跟着 KV 命中变。KV 命中只查 $c$ 个候选，KV 未命中还要查这段历史的 $a_u$ 个 id：
 
 $$
-N_t=(1-I_t)\,a_{u_t}+c
+N_t=(1-I_t)a_{u_t}+c
 $$
 
 $I_t$ 是这条请求的 KV 命中指示，取值 0 或 1。embedding cache 的命中率是 $e$。一条请求的取数时间是
 
 $$
-L_{\mathrm{emb},t}=N_t\Big(e\,L_{\mathrm{embedding}}+(1-e)\,L^{\mathrm{miss}}_{\mathrm{embedding}}\Big)
+L_{\mathrm{emb},t}=N_t\Big(eL_{\mathrm{embedding}}+(1-e)L^{\mathrm{miss}}_{\mathrm{embedding}}\Big)
 $$
 
 GPU 命中是纳秒，平均时拿掉。8000 条上，KV 未命中请求的平均历史 id 数是 $\bar a$，每条请求的 embedding miss 次数是
 
 $$
-n(h,e)=(1-h)\,\bar a\,(1-e)+c\,(1-e)
+n(h,e)=(1-h)\bar a(1-e)+c(1-e)
 $$
 
 
@@ -217,7 +217,7 @@ $S_k\ge B$ 时第二遍不再淘汰任何人，$h=1$。$S_k<B$ 时，只出现�
 3 层这条流量 $B=48.72\mathrm{GiB}$。8000 条里有 2655 条只出现一次。48.00 GiB 时 cache 里已经有 4393 个用户，这个空位仍会在第二遍里转圈，2655 条全部未命中，$h=0.66$。容量加到 48.72 GiB，空位消失，$h$ 跳到 1。所以
 
 $$
-h(S_k)=\frac{T_+}{T}\,h_+(S_k)\quad(S_k<B),\qquad h(S_k)=1\quad(S_k\ge B)
+h(S_k)=\frac{T_+}{T}h_+(S_k)\quad(S_k<B),\qquad h(S_k)=1\quad(S_k\ge B)
 $$
 
 T+ 是重复用户的请求数，h+ 是这些请求的命中率。按这个规则做的 LRU 回放和实测逐点一致，差在 0.001 以内。
@@ -229,13 +229,13 @@ embedding cache 的索引是 video id，命中率记为 $e(S_e)$。预热和计�
 一条请求的时间把历史 KV 和 embedding 加在一起。对 8000 条平均：
 
 $$
-\bar L(S_k,S_e)=h(S_k)\,L_{\mathrm{kv}}+(1-h(S_k))\,L^{\mathrm{miss}}_{\mathrm{kv}}+n\big(h(S_k),e(S_e)\big)\,L^{\mathrm{miss}}_{\mathrm{embedding}}
+\bar L(S_k,S_e)=h(S_k)L_{\mathrm{kv}}+(1-h(S_k))L^{\mathrm{miss}}_{\mathrm{kv}}+n\big(h(S_k),e(S_e)\big)L^{\mathrm{miss}}_{\mathrm{embedding}}
 $$
 
 $S_e\ge E$ 时 $n=0$，延迟只剩 $S_k$ 上的命中率：
 
 $$
-\bar L(S_k)=h(S_k)\,L_{\mathrm{kv}}+(1-h(S_k))\,L^{\mathrm{miss}}_{\mathrm{kv}}
+\bar L(S_k)=h(S_k)L_{\mathrm{kv}}+(1-h(S_k))L^{\mathrm{miss}}_{\mathrm{kv}}
 $$
 
 GPU 上 $h$ 随 $S_k$ 升高，这段平均下降，直到 $S_k=B$、$h=1$，之后不再变。CPU 上按上一节的屋顶，$h$ 升高会让这段平均变长，因为 0.208 ms 的命中长于 0.060 ms 的重算。$S_e$ 降到 $E$ 以下之后，$n$ 变大，两项叠在一起。
@@ -263,7 +263,7 @@ $$
 $e=1$ 时 $n=0$，第二项是 0。延迟对比例的斜率只剩命中率这一项。把
 
 $$
-L(h)=L^{\mathrm{miss}}_{\mathrm{kv}}+(L_{\mathrm{kv}}-L^{\mathrm{miss}}_{\mathrm{kv}})\,h
+L(h)=L^{\mathrm{miss}}_{\mathrm{kv}}+(L_{\mathrm{kv}}-L^{\mathrm{miss}}_{\mathrm{kv}})h
 $$
 
 代进去，对 $h$ 的斜率就是 Lkv − Lmisskv。上一节的 $L(h)$ 给出：
@@ -294,7 +294,7 @@ $$
 f^{*}=
 \begin{cases}
 f_{\min}, & L_{\mathrm{kv}}>L^{\mathrm{miss}}_{\mathrm{kv}}\\[4pt]
-\left[\dfrac{B}{M},\,1-\dfrac{E}{M}\right], & L_{\mathrm{kv}}<L^{\mathrm{miss}}_{\mathrm{kv}},\ M\ge B+E\\[8pt]
+\left[\dfrac{B}{M},1-\dfrac{E}{M}\right], & L_{\mathrm{kv}}<L^{\mathrm{miss}}_{\mathrm{kv}},\ M\ge B+E\\[8pt]
 1-\dfrac{E}{M}, & L_{\mathrm{kv}}<L^{\mathrm{miss}}_{\mathrm{kv}},\ M<B+E
 \end{cases}
 $$
