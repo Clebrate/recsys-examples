@@ -11,9 +11,17 @@ KV miss 直接在 GPU 上重算。embedding miss 进 CPU 参数表。
 
 每张图的左轴是平均延迟，右轴是命中率。蓝线是 GPU KV token 命中率。橙线是 embedding 命中率。
 
-对于 KV 而言。\(L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.060-0.00788=0.052\mathrm{ms}\)。
+对于 KV 而言，未命中是重算，命中是从 GPU 读 KV。
 
-对于 embedding cache 而言，\(L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.031\mathrm{\mu s}\)。
+$$
+L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.060-0.00788=0.052\ \mathrm{ms}
+$$
+
+对于 embedding 而言，一个 id 未命中走 PCIe，命中走 GPU。
+
+$$
+L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.0325-0.00128=0.031\ \mu\mathrm{s}
+$$
 
 ## Total Cache size = 16 GiB
 
@@ -49,13 +57,33 @@ GPU 上的划分和 Phase1 相同。另外加一块固定的 32 GiB CPU KV cache
 
 图的左轴仍是平均延迟，右轴是 GPU KV token 命中率和 embedding 命中率。
 
-对于 KV 而言，三条路径是 GPU 命中 7.88 µs，CPU 命中 0.208 ms，重算 0.060 ms。
+对于 KV 而言，三条路径是
 
-CPU 相对 GPU，\(0.208-0.00788=0.200\mathrm{ms}\)。
-重算相对 GPU，\(0.060-0.00788=0.052\mathrm{ms}\)。
-重算相对 CPU，\(L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.060-0.208=-0.148\mathrm{ms}\)。
+$$
+\begin{aligned}
+L_{\mathrm{GPU}} &= 7.88\ \mu\mathrm{s} \\
+L_{\mathrm{CPU}} &= 0.208\ \mathrm{ms} \\
+L_{\mathrm{recompute}} &= 0.060\ \mathrm{ms}
+\end{aligned}
+$$
 
-对于 embedding cache 而言，\(L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.031\mathrm{\mu s}\)。
+两两相减：
+
+$$
+\begin{aligned}
+L_{\mathrm{CPU}}-L_{\mathrm{GPU}} &= 0.208-0.00788=0.200\ \mathrm{ms} \\
+L_{\mathrm{recompute}}-L_{\mathrm{GPU}} &= 0.060-0.00788=0.052\ \mathrm{ms} \\
+L_{\mathrm{recompute}}-L_{\mathrm{CPU}} &= 0.060-0.208=-0.148\ \mathrm{ms}
+\end{aligned}
+$$
+
+第三行里 miss 是重算，hit 是 CPU 命中，所以 $L_{\mathrm{miss}}-L_{\mathrm{hit}}$ 是负的。CPU 命中最慢，GPU 命中最快，重算在中间。
+
+对于 embedding 而言，和 Phase1 相同。
+
+$$
+L_{\mathrm{miss}}-L_{\mathrm{hit}}=0.031\ \mu\mathrm{s}
+$$
 
 
 ## Total Cache size = 16 GiB
