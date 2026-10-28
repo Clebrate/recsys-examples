@@ -77,14 +77,14 @@ $$
 
 | 项            | 字节         | 一层       |
 | ------------ | ---------- | -------- |
-| uvqk 权重      | $8Hdd_h$   | 2 MiB    |
-| 输出投影权重       | $2Hdd_h$   | 0.5 MiB  |
-| 输入激活         | $2td_h$    | 2 MiB    |
+| uvqk 权重      | $8Hd\cdot d_h$   | 2 MiB    |
+| 输出投影权重       | $2Hd\cdot d_h$   | 0.5 MiB  |
+| 输入激活         | $2t\cdot d_h$    | 2 MiB    |
 | uvqk 输出      | $8tHd$     | 8 MiB    |
 | attention 输出 | $2tHd$     | 2 MiB    |
-| 投影输出         | $2td_h$    | 2 MiB    |
-| 一层合计         | blayer     | 16.5 MiB |
-| 三层           | N · blayer | 49.5 MiB |
+| 投影输出         | $2t\cdot d_h$    | 2 MiB    |
+| 一层合计         | $b_{\mathrm{layer}}$ | 16.5 MiB |
+| 三层           | $N\cdot b_{\mathrm{layer}}$ | 49.5 MiB |
 
 
 一层：
@@ -141,7 +141,7 @@ $$
 
 ##### a. 在 CPU 中命中
 
-Lkv 取上一节的合计：
+$L_{\mathrm{kv}}$ 取上一节的合计：
 
 $$
 L_{\mathrm{kv,CPU}}(h)=0.060+0.148h\ \mathrm{ms}
@@ -212,17 +212,17 @@ $$
 B=\sum_{u\in W}b_u
 $$
 
-$S_k\ge B$ 时第二遍不再淘汰任何人，$h=1$。$S_k<B$ 时，只出现一次的请求全部未命中：两次访问隔着整圈流量，中间的用户总量就是 $B$。
+$S_k\ge B$ 时第二遍不再淘汰任何人， $h=1$。 $S_k\lt B$ 时，只出现一次的请求全部未命中：两次访问隔着整圈流量，中间的用户总量就是 $B$。
 
-3 层这条流量 $B=48.72\mathrm{GiB}$。8000 条里有 2655 条只出现一次。48.00 GiB 时 cache 里已经有 4393 个用户，这个空位仍会在第二遍里转圈，2655 条全部未命中，$h=0.66$。容量加到 48.72 GiB，空位消失，$h$ 跳到 1。所以
+3 层这条流量 $B=48.72\mathrm{GiB}$。8000 条里有 2655 条只出现一次。48.00 GiB 时 cache 里已经有 4393 个用户，这个空位仍会在第二遍里转圈，2655 条全部未命中， $h=0.66$。容量加到 48.72 GiB，空位消失， $h$ 跳到 1。所以
 
 $$
-h(S_k)=\frac{T_+}{T}h_+(S_k)\quad(S_k<B),\qquad h(S_k)=1\quad(S_k\ge B)
+h(S_k)=\frac{T_+}{T}h_+(S_k)\quad(S_k\lt B),\qquad h(S_k)=1\quad(S_k\ge B)
 $$
 
-T+ 是重复用户的请求数，h+ 是这些请求的命中率。按这个规则做的 LRU 回放和实测逐点一致，差在 0.001 以内。
+$T_+$ 是重复用户的请求数， $h_+$ 是这些请求的命中率。按这个规则做的 LRU 回放和实测逐点一致，差在 0.001 以内。
 
-embedding cache 的索引是 video id，命中率记为 $e(S_e)$。预热和计时走同一串请求。$S_e\ge E$ 时，计时这一遍要查的 id 都已经在 cache 里，$e=1$。3 层的 $E=3.08\mathrm{GiB}$。$S_e<E$ 之后 $e$ 随 $S_e$ 下降，$n$ 上升。
+embedding cache 的索引是 video id，命中率记为 $e(S_e)$。预热和计时走同一串请求。 $S_e\ge E$ 时，计时这一遍要查的 id 都已经在 cache 里， $e=1$。3 层的 $E=3.08\mathrm{GiB}$。 $S_e\lt E$ 之后 $e$ 随 $S_e$ 下降， $n$ 上升。
 
 ### latency 与 cache size 的关系
 
@@ -238,7 +238,7 @@ $$
 \bar L(S_k)=h(S_k)L_{\mathrm{kv}}+(1-h(S_k))L^{\mathrm{miss}}_{\mathrm{kv}}
 $$
 
-GPU 上 $h$ 随 $S_k$ 升高，这段平均下降，直到 $S_k=B$、$h=1$，之后不再变。CPU 上按上一节的屋顶，$h$ 升高会让这段平均变长，因为 0.208 ms 的命中长于 0.060 ms 的重算。$S_e$ 降到 $E$ 以下之后，$n$ 变大，两项叠在一起。
+GPU 上 $h$ 随 $S_k$ 升高，这段平均下降，直到 $S_k=B$、 $h=1$，之后不再变。CPU 上按上一节的屋顶， $h$ 升高会让这段平均变长，因为 0.208 ms 的命中长于 0.060 ms 的重算。 $S_e$ 降到 $E$ 以下之后， $n$ 变大，两项叠在一起。
 
 ### latency 与 cache ratio 的关系
 
@@ -252,7 +252,7 @@ $$
 \bar L(f)=\bar L\big(fM,\ (1-f)M\big)
 $$
 
-$f$ 变大时 $dh/df\ge 0$、$de/df\le 0$。embedding 还盖得住是 $e=1$，对应 $f\le 1-\frac{E}{M}$。KV 已经全中是 $h=1$，对应 $f\ge\frac{B}{M}$。两份工作集同时装下是 $B+E\le M$；这时在 $\frac{B}{M}\le f\le 1-\frac{E}{M}$ 上有 $h=1$ 且 $e=1$。
+$f$ 变大时 $dh/df\ge 0$、 $de/df\le 0$。embedding 还盖得住是 $e=1$，对应 $f\le 1-\frac{E}{M}$。KV 已经全中是 $h=1$，对应 $f\ge\frac{B}{M}$。两份工作集同时装下是 $B+E\le M$；这时在 $\frac{B}{M}\le f\le 1-\frac{E}{M}$ 上有 $h=1$ 且 $e=1$。
 
 ### 求导 并计算极点
 
@@ -266,10 +266,10 @@ $$
 L(h)=L^{\mathrm{miss}}_{\mathrm{kv}}+(L_{\mathrm{kv}}-L^{\mathrm{miss}}_{\mathrm{kv}})h
 $$
 
-代进去，对 $h$ 的斜率就是 Lkv − Lmisskv。上一节的 $L(h)$ 给出：
+代进去，对 $h$ 的斜率就是 $L_{\mathrm{kv}}-L^{\mathrm{miss}}_{\mathrm{kv}}$。上一节的 $L(h)$ 给出：
 
 
-| 路径       | Lkv − Lmisskv                   | $e=1$ 且 $h$ 还在增加时 |
+| 路径       | $L_{\mathrm{kv}}-L^{\mathrm{miss}}_{\mathrm{kv}}$ | $e=1$ 且 $h$ 还在增加时 |
 | -------- | ------------------------------- | ----------------- |
 | KV 在 GPU | 7.88 µs − 0.060 ms = −0.052 ms  | $f$ 增大，延迟下降       |
 | KV 在 CPU | 0.208 ms − 0.060 ms = +0.148 ms | $f$ 增大，延迟上升       |
@@ -277,49 +277,49 @@ $$
 
 极点由这四样决定：
 
-- Lkv − Lmisskv：命中比重算便宜还是贵，来自上面的 $L(h)$。
-- $B$：$f=B/M$ 时 $h$ 到 1，$dh/df$ 变为 0。
-- $E$：$f=1-E/M$ 时 $e$ 离开 1。过了这条线 $dn/df>0$，第二项变正。$n$ 怎么涨还取决于 $\bar a$、$c$，以及 $e$ 随 $S_e$ 下降的速度。
-- Lmissembedding：一次 embedding miss 有多贵。它决定第二项能不能盖过第一项。
+- $L_{\mathrm{kv}}-L^{\mathrm{miss}}_{\mathrm{kv}}$：命中比重算便宜还是贵，来自上面的 $L(h)$。
+- $B$： $f=B/M$ 时 $h$ 到 1， $dh/df$ 变为 0。
+- $E$： $f=1-E/M$ 时 $e$ 离开 1。过了这条线 $dn/df\gt 0$，第二项变正。 $n$ 怎么涨还取决于 $\bar a$、 $c$，以及 $e$ 随 $S_e$ 下降的速度。
+- $L^{\mathrm{miss}}_{\mathrm{embedding}}$：一次 embedding miss 有多贵。它决定第二项能不能盖过第一项。
 
-极点 $f^{*}$ 是导数为零的比例，$S_k^{*}=f^{*}M$。令 $d\bar L/df=0$：
-
-$$
-\left.\frac{dh}{df}\right|_{f^{*}}=\frac{L^{\mathrm{miss}}_{\mathrm{embedding}}}{L^{\mathrm{miss}}_{\mathrm{kv}}-L_{\mathrm{kv}}}\left.\frac{dn}{df}\right|_{f^{*}}
-$$
-
-$h$ 在 $f=B/M$ 饱和，$e$ 在 $f=1-E/M$ 离开 1。用这两个阈值把上式收成：
+极点 $f^{\ast}$ 是导数为零的比例， $S_k^{\ast}=f^{\ast}M$。令 $d\bar L/df=0$：
 
 $$
-f^{*}=
+\left.\frac{dh}{df}\right|_{f^{\ast}}=\frac{L^{\mathrm{miss}}_{\mathrm{embedding}}}{L^{\mathrm{miss}}_{\mathrm{kv}}-L_{\mathrm{kv}}}\left.\frac{dn}{df}\right|_{f^{\ast}}
+$$
+
+$h$ 在 $f=B/M$ 饱和， $e$ 在 $f=1-E/M$ 离开 1。用这两个阈值把上式收成：
+
+$$
+f^{\ast}=
 \begin{cases}
-f_{\min}, & L_{\mathrm{kv}}>L^{\mathrm{miss}}_{\mathrm{kv}}\\[4pt]
-\left[\dfrac{B}{M},1-\dfrac{E}{M}\right], & L_{\mathrm{kv}}<L^{\mathrm{miss}}_{\mathrm{kv}},\ M\ge B+E\\[8pt]
-1-\dfrac{E}{M}, & L_{\mathrm{kv}}<L^{\mathrm{miss}}_{\mathrm{kv}},\ M<B+E
+f_{\min} \quad L_{\mathrm{kv}}\gt L^{\mathrm{miss}}_{\mathrm{kv}} \cr
+\left[\dfrac{B}{M},1-\dfrac{E}{M}\right] \quad L_{\mathrm{kv}}\lt L^{\mathrm{miss}}_{\mathrm{kv}},\ M\ge B+E \cr
+1-\dfrac{E}{M} \quad L_{\mathrm{kv}}\lt L^{\mathrm{miss}}_{\mathrm{kv}},\ M\lt B+E
 \end{cases}
 $$
 
-第三行用的是边界上第二项已经不小于第一项。若 $n$ 涨得更慢，$f^{*}$ 改由第一式在 $f>1-E/M$ 的根决定。$f_{\min}$ 是扫描里最小的 KV 比例。
+第三行用的是边界上第二项已经不小于第一项。若 $n$ 涨得更慢， $f^{\ast}$ 改由第一式在 $f\gt 1-E/M$ 的根决定。 $f_{\min}$ 是扫描里最小的 KV 比例。
 
-Lkv < Lmisskv 时，左端 $f$ 增大延迟下降，极点在延迟重新变长的地方。
+$L_{\mathrm{kv}}\lt L^{\mathrm{miss}}_{\mathrm{kv}}$ 时，左端 $f$ 增大延迟下降，极点在延迟重新变长的地方。
 
-- $M<B+E$ 时，$e$ 先于 $h=1$ 掉下来。若一过 $f=1-E/M$ 第二项就大于第一项，极点就在这条边界上：
+- $M\lt B+E$ 时， $e$ 先于 $h=1$ 掉下来。若一过 $f=1-E/M$ 第二项就大于第一项，极点就在这条边界上：
 
 $$
-f^{*}=1-\frac{E}{M},\qquad S_k^{*}=M-E
+f^{\ast}=1-\frac{E}{M},\qquad S_k^{\ast}=M-E
 $$
 
 若第二项涨得慢，极点在边界右侧，位置由上面的抵消式和 $e(S_e)$ 一起决定。
 
-- $M\ge B+E$ 时，$h$ 先到 1。从 $f=B/M$ 到 $f=1-E/M$，$h=1$ 且 $e=1$，两项导数都是 0，极点是这一整段。右端仍然是 $f=1-E/M$。
+- $M\ge B+E$ 时， $h$ 先到 1。从 $f=B/M$ 到 $f=1-E/M$， $h=1$ 且 $e=1$，两项导数都是 0，极点是这一整段。右端仍然是 $f=1-E/M$。
 
-Lkv > Lmisskv 时，第一项在 $h$ 增加的过程中已经是正的，$f$ 越大延迟越长。极点在 $f$ 最小的那一端，位置不再依赖 $E$。
+$L_{\mathrm{kv}}\gt L^{\mathrm{miss}}_{\mathrm{kv}}$ 时，第一项在 $h$ 增加的过程中已经是正的， $f$ 越大延迟越长。极点在 $f$ 最小的那一端，位置不再依赖 $E$。
 
 ### 带入一个真实的case 进行计算
 
-case 用 3 层配置和这份 KuaiRand。Bkv = 12 MiB，Bemb = 2048 B，$B=48.72\mathrm{GiB}$，$E=3.08\mathrm{GiB}$。重算屋顶 0.060 ms，GPU 命中 7.88 µs，CPU 命中 0.208 ms。
+case 用 3 层配置和这份 KuaiRand。Bkv = 12 MiB，Bemb = 2048 B， $B=48.72\mathrm{GiB}$， $E=3.08\mathrm{GiB}$。重算屋顶 0.060 ms，GPU 命中 7.88 µs，CPU 命中 0.208 ms。
 
-同一台机器上，embedding 还盖得住、请求尚未全中的点，命中率每增加 1，平均延迟下降 0.515 ms，残差 0.020 ms。这个 0.515 ms 大约是屋顶上 0.052 ms 的十倍，历史 KV 以外的 kernel 也算在里面。用它替换 Lmisskv 之后，GPU 上 $h$ 每增加 1 仍下降，下降量改成 0.515 ms。CPU 上 $0.515-0.208=0.307\mathrm{ms}$，命中变成省时间，屋顶里那一项 $+0.148\mathrm{ms}$ 的方向被反过来。FlexKV 的曲线在命中率上升时仍往下走，跟的是这个实测差。
+同一台机器上，embedding 还盖得住、请求尚未全中的点，命中率每增加 1，平均延迟下降 0.515 ms，残差 0.020 ms。这个 0.515 ms 大约是屋顶上 0.052 ms 的十倍，历史 KV 以外的 kernel 也算在里面。用它替换 $L^{\mathrm{miss}}_{\mathrm{kv}}$ 之后，GPU 上 $h$ 每增加 1 仍下降，下降量改成 0.515 ms。CPU 上 $0.515-0.208=0.307\mathrm{ms}$，命中变成省时间，屋顶里那一项 $+0.148\mathrm{ms}$ 的方向被反过来。FlexKV 的曲线在命中率上升时仍往下走，跟的是这个实测差。
 
 Redis 的极点位置不用改。90 次 miss 的取数已经大于这一小步里 0.515 ms 能省下的时间，导数仍在 $S_e=E$ 变号。
 
@@ -333,7 +333,7 @@ Redis 的极点位置不用改。90 次 miss 的取数已经大于这一小步�
 
 16 GiB 的 GPU + Redis 在 0.80 和 0.85 之间转头，0.80 到 0.95 升高 0.408 ms。32 GiB 在 0.90 和 0.95 之间转头，升高 0.210 ms。64 GiB 从 0.80 到 0.95 命中率已经是 1，平均延迟停在 2.924–2.934 ms，embedding 最少还有 3.20 GiB，仍高于 3.08 GiB，平底和这四格重合。
 
-CPU 参数表把 Lmissembedding 换成 0.026 µs/id。同样 90 次 miss 只值 0.002 ms，盖不住 0.515 ms 这一档的命中收益。导数要到 embedding 只剩大约 0.4 GiB 才变成正的。16 GiB 的最低在 $f\approx 0.96$–$0.97$，32 GiB 在 $f\approx 0.99$，比把预算全部给 KV 只低 0.004–0.006 ms，小于残差 0.020 ms，也落在 0.05 一格的网格右端之外。测到的 16 GiB 和 32 GiB 因此一路降到 0.95。
+CPU 参数表把 $L^{\mathrm{miss}}_{\mathrm{embedding}}$ 换成 0.026 µs/id。同样 90 次 miss 只值 0.002 ms，盖不住 0.515 ms 这一档的命中收益。导数要到 embedding 只剩大约 0.4 GiB 才变成正的。16 GiB 的最低在 $f\approx 0.96$– $0.97$，32 GiB 在 $f\approx 0.99$，比把预算全部给 KV 只低 0.004–0.006 ms，小于残差 0.020 ms，也落在 0.05 一格的网格右端之外。测到的 16 GiB 和 32 GiB 因此一路降到 0.95。
 
 ## 实际测试
 
