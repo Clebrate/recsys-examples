@@ -10,10 +10,16 @@ Cache ratio: 0.05 - 0.95, 步长 = 0.05
 从实验结果来看，将结果分为下面三类：
 
 1. [KV 占主导](#sec-kv)：KV 的收益 > embedding 的收益，如 embedding table 位于 CPU。
-2. [embedding 占主导](#sec-emb)：embedding 的收益 > KV 的收益，如 embedding table 位于 Redis。
-3. [模拟实验](#sec-sim)：让 KV 的代价和 embedding 的代价沿 cache ratio 变化是同样量级。
 
+embedding hit rate < 1 后一次 embedding miss 只有 0.031 µs，KV 一次命中省 0.052 ms。延迟随 KV 比例下降，最低在最右。
 
+1. [embedding 占主导](#sec-emb)：embedding 的收益 > KV 的收益，如 embedding table 位于 Redis。
+
+KV cache ratio 每增加 a，Redis 代价约 0.15a ms，KV 只省 0.052a ms。最低点在 embedding hit rate < 1 的临界点。
+
+1. [模拟实验](#sec-sim)：让 KV 的代价和 embedding 的代价沿 cache ratio 变化是同样量级。可以看到一个最低点。
+
+（Note: 前面两类 embedding 会先全中，miss 只占右边几格，即使使用 his = 4k。所以 warmup 和正式 benchmark 用不同流量，一开始 embedding hit rate 就不到 1，能观察到的 tradeoff 更多。）
 
 # 一、KV 占主导
 
@@ -42,7 +48,7 @@ $$
 \end{aligned}
 $$
 
-KV miss 直接在 GPU 上重算。embedding miss 进 CPU 参数表。这一节是情形1：跳变后一次 embedding miss 只有 0.031 µs，KV 仍主导，最低在最右。
+KV miss 直接在 GPU 上重算。embedding miss 进 CPU 参数表。
 
 每张图的左轴是平均延迟，右轴是命中率。蓝线是 GPU KV token 命中率。橙线是 embedding 命中率。
 
@@ -77,7 +83,7 @@ KV miss 直接在 GPU 上重算。embedding miss 进 CPU 参数表。这一节�
 
 # Phase2: KVCache and embedding cache in GPU，KV miss first CPU load and recompute，embedding miss use CPU parameter table.
 
-GPU 上 KV 和 embedding 按比例划分。另外加一块固定的 32 GiB CPU KV cache (CPU hit rate： ～0.4)。KV 先查 GPU，没有再查这块 CPU cache，两边都没有才重算。embedding miss 进 CPU 参数表。这一节的特征是情形1：跳变后 KV 收益大于 embedding，延迟继续下降。
+GPU 上 KV 和 embedding 按比例划分。另外加一块固定的 32 GiB CPU KV cache (CPU hit rate： ～0.4)。KV 先查 GPU，没有再查这块 CPU cache，两边都没有才重算。embedding miss 进 CPU 参数表。KV 收益大于 embedding，延迟继续下降。
 
 图的左轴仍是平均延迟，右轴是 GPU KV token 命中率和 embedding 命中率。
 
@@ -153,7 +159,7 @@ embedding 走 Redis 时，一条请求的 miss 是一次 MGET，大约 30 µs + 
 
 KV miss 直接在 GPU 上重算。embedding miss 进本机 Redis。
 
-每张图的左轴是平均延迟，右轴是命中率。绿线是粗扫实测，浅绿三角是细扫实测，灰虚线是理论延迟。蓝线是 GPU KV token 命中率。橙线是 embedding 命中率。红点是最小 / 折中，标在 embedding 还能全中的最后一格（角点）。全中段里的数值最低点是波动，不标。细扫在另一台机器上，绝对延迟有差异，图上把细扫第一格平移到粗扫跳变点。
+每张图的左轴是平均延迟，右轴是命中率。绿线是粗扫实测，浅绿三角是细扫实测，灰虚线是理论延迟。蓝线是 GPU KV token 命中率。橙线是 embedding 命中率。红点是 trade off，标在 embedding 还能全中的最后一格。
 
 对于 KV 而言，未命中是重算，命中是从 GPU 读 KV。
 
@@ -176,7 +182,8 @@ $$
 \end{aligned}
 $$
 
-\Delta m 是每条请求 miss 的 video id 个数，跳变后大约 90–350。16 GiB 从 0.80 到 0.85，\Delta h \approx 0.011，KV 只省 0.0006 ms；\Delta m = 136，Redis 大约 0.15 ms。所以跳变后是 embedding 主导，折中在角点。灰线和实测升高一致。
+\Delta m 是每条请求 miss 的 video id 个数，embedding hit rate < 1 后大约 90–350。16 GiB 从 0.80 到 0.85，\Delta h \approx 0.011，KV 只省 0.0006 ms；\Delta m = 136，Redis 大约 0.15 ms。所以 embedding 主导时，折中在embedding hit rate
+< 1 的临界点。
 
 ### Total Cache size = 16 GiB
 
@@ -184,7 +191,7 @@ $$
 
 当 KV 比例 ≤ 0.80 时，embedding cache ≥ 16 × (1 − 0.80) = 3.20 GiB，命中率是 1，miss 个数是 0。0.05 到 0.80 平均延迟 3.412–3.522 ms，是波动。
 
-跳变点在 0.80。之后命中率和每条请求 miss 的 video id 个数：
+embedding hit rate < 1 的临界点在 0.80。之后命中率和每条请求 miss 的 video id 个数：
 
 - 0.80：命中率 1，miss 0
 - 0.81 ：命中率 0.884，miss 约 94
@@ -200,7 +207,7 @@ miss 个数大约 90–350。粗扫从 0.80 的 3.522 ms 升到 0.85、0.90、0.
 
 当 KV 比例 ≤ 0.90 时，embedding cache ≥ 32 × (1 − 0.90) = 3.20 GiB，命中率是 1，miss 个数是 0。这一段是波动，不标最低点。
 
-跳变点在 0.90。之后：
+embedding hit rate < 1 的临界点在 0.90。之后：
 
 - 0.90：命中率 1，miss 0
 - 0.91 ：命中率 0.797，miss 约 123
@@ -212,7 +219,7 @@ miss 个数大约 120–180。粗扫从 0.90 的 3.397 ms 升到 0.95 的 3.620 
 
 ![64 GiB GPU，embedding miss 走 Redis](figures/gpu_redis_p1_64_jump.png)
 
-KV 比例从 0.05 到 0.95，embedding cache ≥ 3.20 GiB，命中率是 1，请求没有进 Redis，没有跳变点。0.80 之前是 GPU+重算。KV 全部命中从比例 0.80 开始，GPU KV = 51.20 GiB，大于 48.72 GiB，这一段是单独 cache。
+KV 比例从 0.05 到 0.95，embedding cache ≥ 3.20 GiB，命中率是 1，请求没有进 Redis，没有embedding hit rate < 1 的点。0.80 之前是 GPU+重算。KV 全部命中从比例 0.80 开始，GPU KV = 51.20 GiB，大于 48.72 GiB，这一段是单独 cache。
 
 因此，平均延迟随着 KV cache ratio 的增加而下降，KV 全中之后走平。0.80、0.85、0.90、0.95 的延迟是 2.971、2.883、2.944、2.956 ms，差 0.06–0.09 ms。
 
@@ -251,7 +258,7 @@ KV cache ratio = 0.05 时：GPU 命中 0.012，CPU 命中 0.430，重算 0.558�
 KV cache ratio = 0.80：GPU 命中 0.256，CPU 命中 0.201，重算 0.544。
 这一段平均延迟 3.375–3.458 ms，是波动。
 
-跳变点在 0.80，这是 embedding 命中率最后一次等于 1 的格子。之后 0.85、0.90、0.95 降到 0.762、0.692、0.559。每条请求的 miss 是 137、177、254 次，取数时间是 0.134、0.171、0.244 ms。平均延迟从 0.80 的 3.458 ms 升到 0.95 的 3.721 ms，升高 0.263 ms。
+embedding hit rate < 1 的临界点在 0.80，这是 embedding 命中率最后一次等于 1 的格子。之后 0.85、0.90、0.95 降到 0.762、0.692、0.559。每条请求的 miss 是 137、177、254 次，取数时间是 0.134、0.171、0.244 ms。平均延迟从 0.80 的 3.458 ms 升到 0.95 的 3.721 ms，升高 0.263 ms。
 
 ### Total Cache size = 32 GiB
 
@@ -262,13 +269,13 @@ KV cache ratio = 0.05 时：GPU 命中 0.036，CPU 命中 0.415，重算 0.549�
 KV cache ratio = 0.90：GPU 命中 0.466，CPU 命中 0.027，重算 0.507。
 这一段是波动，不标最低点。
 
-跳变点在 0.90，这是 embedding 命中率最后一次等于 1 的格子。之后只有 0.95，命中率 0.692。每条请求 177 次 miss，取数时间 0.171 ms。平均延迟从 0.90 的 3.395 ms 升到 3.635 ms，升高 0.240 ms。
+embedding hit rate < 1 的临界点在 0.90，这是 embedding 命中率最后一次等于 1 的格子。之后只有 0.95，命中率 0.692。每条请求 177 次 miss，取数时间 0.171 ms。平均延迟从 0.90 的 3.395 ms 升到 3.635 ms，升高 0.240 ms。
 
 ### Total Cache size = 64 GiB
 
 ![64 GiB GPU 预算加 32 GiB CPU KV，embedding miss 走 Redis](figures/gpu_host32_redis_64_jump.png)
 
-KV 比例从 0.05 到 0.95，embedding cache ≥ 3.20 GiB，命中率是 1，embedding miss 时间是 0，没有跳变点。0.55 之前是 GPU+CPU+重算，0.55 到 0.80 是 GPU+重算（CPU 独占命中已经是 0）。KV 全部在 GPU 命中从比例 0.80 开始，GPU KV = 51.20 GiB，大于 48.72 GiB，这一段是单独 cache。
+KV 比例从 0.05 到 0.95，embedding cache ≥ 3.20 GiB，命中率是 1，embedding miss 时间是 0，没有embedding hit rate < 1 的点。0.55 之前是 GPU+CPU+重算，0.55 到 0.80 是 GPU+重算（CPU 独占命中已经是 0）。KV 全部在 GPU 命中从比例 0.80 开始，GPU KV = 51.20 GiB，大于 48.72 GiB，这一段是单独 cache。
 KV cache ratio = 0.05 时：GPU 命中 0.073，CPU 命中 0.378，重算 0.549。
 KV cache ratio = 0.80：GPU 命中 1，CPU 命中 0，重算 0。
 
@@ -276,7 +283,7 @@ KV cache ratio = 0.80：GPU 命中 1，CPU 命中 0，重算 0。
 
 ## Phase3-H4K: his = 4096，KV miss uses recompute，embedding miss use Redis.
 
-GPU 上 KV 和 embedding 按比例划分，没有额外的 CPU KV。同一份 KuaiRand-27K 前半段，历史上限 4096。KV 工作集是 146.44 GiB，embedding 全部命中要 6.75 GiB。KV miss 在 GPU 上重算。embedding miss 进本机 Redis。图上橙色虚线标在 embedding 命中率最后一次等于 1 的格子，作为跳变点。
+GPU 上 KV 和 embedding 按比例划分，没有额外的 CPU KV。同一份 KuaiRand-27K 前半段，历史上限 4096。KV 工作集是 146.44 GiB，embedding 全部命中要 6.75 GiB。KV miss 在 GPU 上重算。embedding miss 进本机 Redis。
 
 没有 miss 的取数时间是 0，有 m 个 miss 是 30 µs + 0.87 µs × m。
 
@@ -286,7 +293,7 @@ GPU 上 KV 和 embedding 按比例划分，没有额外的 CPU KV。同一份 Ku
 
 当 KV 比例 ≤ 0.55 时，embedding cache ≥ 16 × (1 − 0.55) = 7.20 GiB，命中率是 1。0.05 到 0.55 的 miss 时间都是 0。GPU KV 最大 15.20 GiB，小于 146.44 GiB，请求命中从 0.008 升到 0.074。平均延迟 3.720–3.881 ms，是波动。
 
-跳变点在 0.55，这是 embedding 命中率最后一次等于 1 的格子。之后 0.60 到 0.95 降到 0.930、0.905、0.874、0.836、0.787、0.718、0.621、0.477。每条请求的 miss 是 191、258、340、439、569、746、999、1369 次，取数时间是 0.177、0.238、0.312、0.401、0.516、0.673、0.895、1.219 ms。0.60 的平均延迟 3.833 ms 仍在全中段的抖动里；从 0.70 的 4.189 ms 升到 0.95 的 5.391 ms。0.95 的 GPU KV token 命中是 0.118。
+embedding hit rate < 1 的临界点在 0.55，这是 embedding 命中率最后一次等于 1 的格子。之后 0.60 到 0.95 降到 0.930、0.905、0.874、0.836、0.787、0.718、0.621、0.477。每条请求的 miss 是 191、258、340、439、569、746、999、1369 次，取数时间是 0.177、0.238、0.312、0.401、0.516、0.673、0.895、1.219 ms。0.60 的平均延迟 3.833 ms 仍在全中段的抖动里；从 0.70 的 4.189 ms 升到 0.95 的 5.391 ms。0.95 的 GPU KV token 命中是 0.118。
 
 ![16 GiB，历史 4096，Redis 细扫，从第一格 miss 起](figures/gpu_redis_h4k_fine_16_corner.png)
 
@@ -304,11 +311,11 @@ GPU 上 KV 和 embedding 按比例划分，没有额外的 CPU KV。同一份 Ku
 
 # 三、模拟实验：两边权衡
 
-前面两节的流量是预热和计时同一条：8000 用户，历史上限 1024，Zipf seed=1，计时是预热的第二遍。embedding 在跳变前全中，miss 是断崖，折中只能钉在角点。
+前面两节的流量是预热和计时同一条：8000 用户，历史上限 1024，Zipf seed=1，计时是预热的第二遍。
 
 这一节换了 benchmark 流量。用户池改成全量合格用户，历史上限 4096，26000 条。预热 seed=1，计时 seed=2，两条流的 id 不完全重合。计时里有一批预热没见过的 id，左边 15.20 GiB 也装不下并集，所以 embedding 从第一格就不是全中。
 
-# Phase7: 双流，KV miss uses recompute，embedding miss use CPU parameter table.
+## Phase7: 双流，KV miss uses recompute，embedding miss use CPU parameter table.
 
 历史上限 4096，全量用户，预热 seed=1 / 计时 seed=2，26000 条，16 GiB。GPU 上 KV 和 embedding 按比例划分。KV miss 在 GPU 上重算。embedding miss 进 CPU 参数表，没有额外等待。
 
@@ -329,7 +336,7 @@ $$
 
 KV 命中从 0.17% 升到 4.0%，每格 \Delta h \approx 0.002。embedding 命中从 0.97 降到 0.47，每格 \Delta m 从 13 涨到 391。
 
-## Total Cache size = 16 GiB
+### Total Cache size = 16 GiB
 
 ![16 GiB，双流，embedding miss 走 CPU 参数表](figures/gpu_dual_cpu_16_latency_hit.png)
 
@@ -339,11 +346,17 @@ KV 命中从 0.17% 升到 4.0%，每格 \Delta h \approx 0.002。embedding 命�
 
 灰线以上、又和理论凹点同一带的局部低点在 0.50，4.253 ms，比理论高 0.007 ms。理论本身在 0.45 打平。红点折中标在 0.50。
 
-# Phase7-wait: KV miss 空等 14 ms，embedding miss 0.931 µs/id.
+## Phase7-wait: KV miss 空等 14 ms，embedding miss 0.931 µs/id.
 
-同一条双流，16 GiB。上一节凹深只有 0.004 ms，被抖动盖住。这一节给 KV miss 空等 14 ms、embedding miss 空等 0.931 µs/id，让两边沿 cache ratio 的变化到 0.1 ms 以上。
+同一条双流，16 GiB。KV 工作集大约 697 GiB，16 GiB 里 KV 再怎么加，命中也几乎不涨：
 
-图的左轴是平均延迟，右轴是命中率。蓝线是 GPU KV token 命中率。橙线是 embedding 命中率。KV miss 空等 14 ms、embedding miss 空等 0.931 µs/id，两边沿 cache ratio 的变化是：
+$$
+h(0.05)=0.0018,\qquad h(0.95)=0.041
+$$
+
+请求级全中从 0.18% 只到 4.1%，全程只增加 0.039，每格大约 0.002。上一节凹深只有 0.004 ms，被抖动盖住。这一节给 KV miss 空等 14 ms、embedding miss 空等 0.931 µs/id，让每格变化到 0.03 ms 这一档。
+
+图的左轴是平均延迟，右轴是命中率。蓝线是 GPU KV token 命中率。橙线是 embedding 命中率。KV miss 空等 14 ms、embedding miss 空等 0.931 µs/id（目的是拉开变化差距），两边沿 cache ratio 的变化是：
 
 $$
 L(f)=14.515\,(1-h(f))\ \mathrm{ms}+0.931\ \mu\mathrm{s}\times m(f)
@@ -356,12 +369,12 @@ $$
 \end{aligned}
 $$
 
-h 是请求级 KV 全中。图上是已经写完的 0.05–0.55，后面 8 格还在跑。
 
-## Total Cache size = 16 GiB
 
-![16 GiB，双流，KV miss 空等 14 ms](figures/gpu_dual_wait14_16_mean.png)
+### Total Cache size = 16 GiB
 
-平均延迟在 22.760–23.478 ms。纵轴只画这一截。
+![16 GiB，双流，KV miss 空等 14 ms](figures/gpu_dual_wait14_16_080.png)
 
-0.30 的 22.760 ms 是最低。
+图上是已经写完的 0.05–0.80，0.85–0.95 还在跑。平均延迟在 22.347–23.478 ms。纵轴只画这一截。
+
+0.65 的 22.347 ms 是目前最低。0.30 的 22.760 ms 是左边凹底。过了 0.30 抬到 0.45 的 23.478 ms，再掉到 0.65；0.70、0.75、0.80 是 23.162、22.740、22.823 ms。红点折中标在 0.65。
