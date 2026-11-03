@@ -25,7 +25,7 @@ Cache ratio: 0.05–0.95，步长 0.05。
   | KV        | GPU 7.88 µs | 重算 0.060 ms        | 0.052 ms     |
   | embedding | GPU 1.3 µs  | Redis MGET 0.93 ms | 0.93 ms      |
 
-3. [权衡实验](#三权衡实验)：embedding 全命中 19.17 GiB；KV 全命中 30.90 GiB。
+3. [权衡模拟实验](#三权衡模拟实验)：embedding 全命中 19.17 GiB；KV 全命中 30.90 GiB。
 
   |           | 一条请求全 miss 的 wait | 实测命中率变化 | Latency 变化 |
   | --------- | ------------------ | ------- | -------------- |
@@ -84,7 +84,7 @@ KV 比例 ≤ 0.80 时 embedding cache ≥ 3.20 GiB，命中率是 1。0.05 到 
 
 粗扫从 0.80 的 3.522 ms 升到 0.95 的 3.880 ms。
 
-# 三、权衡实验
+# 三、权衡模拟实验
 
 双流。His = 4096，embedding 查整段历史加候选，全命中 cache size = 19.17 GiB。KV 全部命中 cache size = **30.90 GiB**。
 
