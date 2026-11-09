@@ -25,7 +25,7 @@ Cache ratio: 0.05–0.95，步长 0.05。
   | KV        | FlexKV      | 重算                 | 远小于 Redis     |
   | embedding | GPU 1.3 µs  | Redis MGET 0.93 ms | 0.93 ms      |
 
-3. [权衡实验](#三权衡实验)：embedding 全命中 19.17 GiB；KV 全命中 30.90 GiB。能打平是命中率变化和每条请求的 miss 损失一起作用：\(\Delta L=(L_{\mathrm{miss}}-L_{\mathrm{hit}})\times\Delta h\)。
+3. [权衡实验](#三权衡实验)：embedding 全命中 19.17 GiB；KV 全命中 30.90 GiB。能打平是命中率变化和每条请求的 miss 损失一起作用。
 
   |           | 一条请求全 miss 的 wait | 实测命中率变化 | Latency 变化 |
   | --------- | ------------------ | ------- | -------------- |
@@ -51,18 +51,6 @@ $$
 ![16 GiB 平均延迟和命中率](figures/kv_flex_s1cpu_16_min.png)
 
 KV 比例 ≤ 0.80 时，embedding cache ≥ 3.20 GiB，命中率是 1，延迟随 KV 增大往下走。0.85 / 0.90 / 0.95 时 embedding 命中掉到 0.830、0.710、0.555，仍然远小于 KV 那项，延迟继续降，最低在最右 **f=0.95，5.273 ms**。左端 5.614 ms。
-
-### 双流补充：embedding CPU 回源、无额外 wait 基线（16 GiB）
-
-本组采用双流：history cap = 4096，候选 C = 100，预热 seed=1、计时 seed=2，各 26000 条请求；KV / HSTU 仅使用最近 128 个历史 item 及其 action。`placement=kv_flex_gpu`，KV 与 embedding cache 的 GPU 预算合计 16 GiB，embedding miss 走 CPU 参数表。
-
-原始数据：[19 个比例点的 JSONL](cache_ratio_ordinary_kv_flex_gpu_dual_kv128_fixed_noside_16gib.jsonl)。配置见 [运行脚本](run_kv_flex_gpu_dual_kv128_fixed_16.sh) 中的 `dual_kv128_fixed_noside` 组。
-
-| KV 比例 f | GPU/CPU 合并 KV token 命中率 | 平均计时延迟 mean_ms |
-| --- | --- | --- |
-| 0.05 | 4.69% | 3.877 ms |
-| 0.50 | 31.23% | 3.844 ms，本轮扫描最低点 |
-| 0.95 | 49.84% | 3.855 ms |
 
 # 二、embedding 占主导
 
