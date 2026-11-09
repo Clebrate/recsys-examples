@@ -3,7 +3,7 @@ Total cache size: FlexKV 的 KV cache 和 GPU 上的 embedding cache 总量固�
 Workload: KuaiRand-27K 前半段，候选 C = 100。用户按 Zipf α=0.5 抽成请求流，先预热 cache，再计时。
 
 - **同流**：从 8000 个用户中按 Zipf α=0.5 有放回抽取 8000 次，his = 1024 （item 和 action 分别 1k）。warmup 和真实 benchmark 用同一个 seed、同一条请求序列。embedding 全命中需要 3.08 GiB，KV 全命中需要 **48.72 GiB**。
-- **双流**：用户池换成全部合格用户（约 26500），his = 4096（item 和 action 分别 4k），26000 条请求。预热 seed=1，计时 seed=2，两条 Zipf 序列不一样。池子 unique video 约 1005 万，embedding 全中要 19.17 GiB。
+- **双流**：用户池换成全部合格用户（约 26500），his = 4096（item 和 action 分别 4k），26000 条请求。预热 seed=1，计时 seed=2，两条 Zipf 序列不一样。池子 unique video 约 1005 万，embedding 全中要 19.17 GiB。KV 全命中需要 **30.90 GiB**。
 
 Model: `kuairand_1k_inference_ranking.gin`：N = 3，H = 4，d = 128，d_h = 512，s = 1024，t = 2048，c = 100。
 
@@ -54,9 +54,7 @@ KV 比例 ≤ 0.80 时，embedding cache ≥ 3.20 GiB，命中率是 1，延迟�
 
 ### 双流补充：embedding CPU 回源、无额外 wait 基线（16 GiB）
 
-本组采用双流：history cap = 4096，候选 C = 100，预热 seed=1、计时 seed=2，各 26000 条请求；KV / HSTU 仅使用最近 128 个历史 item 及其 action。`placement=kv_flex_gpu`，KV 与 embedding cache 的 GPU 预算合计 16 GiB，embedding miss 走 CPU 参数表。FlexKV 的 CPU KV 层仍然开启，固定为 128 blocks（24 MiB，不计入这 16 GiB 配比），SSD 关闭；不添加 KV 或 embedding 的额外 wait。
-
-**两条 miss 路径需要区分：** embedding 在 GPU 未命中时，从 CPU 参数表获取向量；KV lookup 则合并 GPU 与 CPU 层的可用前缀，GPU 缺少而 CPU 命中的 KV 会通过 onboard 搬回 GPU，两层均未覆盖的部分才由 GPU 重算。配置中的 `flexkv_num_cpu_blocks=128` 是开启的 CPU KV 容量，另有 `flexkv_num_tmp_cpu_blocks=128` 临时缓冲参数，不能把前者只解释成不参与命中的 staging。原始结果记录 `flexkv_enable_cpu=true`，且 `kv_host_hit_last` 约为 0.001621（历史 token 的 0.162%，并非 CPU 回源请求比例），因此该组不是严格关闭 CPU KV 的 GPU-only 实验。
+本组采用双流：history cap = 4096，候选 C = 100，预热 seed=1、计时 seed=2，各 26000 条请求；KV / HSTU 仅使用最近 128 个历史 item 及其 action。`placement=kv_flex_gpu`，KV 与 embedding cache 的 GPU 预算合计 16 GiB，embedding miss 走 CPU 参数表。
 
 原始数据：[19 个比例点的 JSONL](cache_ratio_ordinary_kv_flex_gpu_dual_kv128_fixed_noside_16gib.jsonl)。配置见 [运行脚本](run_kv_flex_gpu_dual_kv128_fixed_16.sh) 中的 `dual_kv128_fixed_noside` 组。
 
@@ -65,31 +63,6 @@ KV 比例 ≤ 0.80 时，embedding cache ≥ 3.20 GiB，命中率是 1，延迟�
 | 0.05 | 4.69% | 3.877 ms |
 | 0.50 | 31.23% | 3.844 ms，本轮扫描最低点 |
 | 0.95 | 49.84% | 3.855 ms |
-
-![16 GiB，双流，KV 窗口 128，embedding CPU 回源且无额外 wait](figures/kv_flex_gpu_dual_kv128_fixed_noside_16_min.png)
-
-图中延迟与 KV token 命中率来自本组 JSONL；KV 命中率采用 `kv_hit_last`，即 GPU/CPU 可用前缀合并后的 token 命中率。embedding 命中率由 [绘图脚本](plot_dual_latency_hit.py) 从同预算的 sidecar 记录补齐，本组无 wait JSONL 未直接记录 embedding 命中率。
-
-**实测结果：** f 从 0.05 增加到 0.95，KV token 命中率从 4.69% 提升到 49.84%，平均计时延迟仅降低约 0.022 ms（0.56%）。全部 19 个点的延迟范围为 3.844–3.911 ms，整体接近平坦，没有随 KV 配额增加持续下降的趋势。f=0.50 是这一轮的最低点；该 JSONL 每个比例只有一个汇总值，未提供跨轮误差，因而暂不将其认定为稳定最优配比。
-
-**理论解释：** 容量配比改变后的延迟变化，可以用下面的均值近似模型理解：
-
-$$
-\Delta L \approx -C_{\mathrm{KV}}\,\Delta h_{\mathrm{req}}
-+c_{\mathrm{emb}}\,\Delta m_{\mathrm{emb}}+\Delta O
-$$
-
-其中，$h_{\mathrm{req}}$ 是请求级 KV 全命中率，$C_{\mathrm{KV}}$ 是一次历史 KV miss 相对 hit 的增量执行成本，$m_{\mathrm{emb}}$ 是每请求 embedding miss 数量，$c_{\mathrm{emb}}$ 是单个 embedding miss 的增量成本，$O$ 表示另列的缓存管理与裁剪等开销。这是近似忽略少量 KV 部分命中请求的解释模型；表格中的 token 命中率不直接替代请求级命中率。
-
-[当前执行路径](cache_ratio_sweep.py) 的 `_forward_with_kv_window()` 有以下特点：
-
-1. **KV 可节省的重算范围有限。** Dense / KV 路径仅保留最近 128 个历史 item 及其 action，最多 256 个历史 token；GPU 和 CPU KV 均未命中的历史部分也只在这个窗口内重算，而非完整 4096 历史 item。
-2. **KV 命中不会省掉完整历史的 embedding 查询。** 代码先执行 `model.sparse_module(batch.features)`，再截取 KV 窗口和删除已缓存前缀。因此，完整历史的 embedding 查询在 KV hit 和 miss 路径上都要执行。
-3. **增加 KV 配额同时压缩 embedding cache。** embedding miss 增加可能抵消一部分 KV 收益，缓存管理与裁剪的变化也应计入。候选计算等共同开销仍然存在，会稀释节省量在总延迟中的相对占比。
-
-这些实现特征为平坦曲线提供了定性解释：KV 命中率的明显提升，可以对应很小的总延迟变化。各项成本的精确贡献仍需本组 GPU 配置下的分段测量；本组 JSONL 的 `split_*` 字段为空，不能仅凭总延迟反推出单次 KV miss 的成本。本组作为双流真实基线保留，不预设其必须呈现 KV 主导趋势。
-
-**计时范围：** 本组无额外 wait 时，`mean_ms` 来自 forward 前后的 CUDA event 区间。`_kv_counts()` 在 `start.record()` 之前执行真实 KV lookup，forward 内复用该 lookup 结果，因此这些数值不包含完整请求路径的全部成本。此处结论限定于当前 benchmark 的计时范围，端到端请求耗时需要另外报告。
 
 # 二、embedding 占主导
 
