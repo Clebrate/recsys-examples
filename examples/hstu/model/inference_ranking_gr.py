@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from contextlib import nullcontext
 from typing import Dict
 
 import torch
@@ -60,6 +61,9 @@ class InferenceRankingGR(torch.nn.Module):
         super().__init__()
         self.sparse_module = sparse_module
         self.dense_module = dense_module
+        self.collect_cache_stats = False
+        self.profile_cache = False
+        self.last_cache_stats = {}
 
     def bfloat16(self):
         """
@@ -133,30 +137,48 @@ class InferenceRankingGR(torch.nn.Module):
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
     ):
+        profile_range = (
+            torch.profiler.record_function if self.profile_cache else nullcontext
+        )
+        self.last_cache_stats = {}
+        self.dense_module.collect_cache_stats = self.collect_cache_stats
+        self.dense_module.profile_cache = self.profile_cache
+        dynamic_collection = getattr(
+            self.sparse_module, "_dynamic_embedding_collection", None
+        )
+        if hasattr(dynamic_collection, "collect_cache_stats"):
+            dynamic_collection.collect_cache_stats = self.collect_cache_stats
         with torch.inference_mode():
             # lookup and allocate for kv cache
-            index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
-                user_ids,
-                total_history_lengths,
-            )
-            kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(
-                index_meta, lookup_res
-            )
+            with profile_range("recsys.kvcache.lookup"):
+                index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
+                    user_ids,
+                    total_history_lengths,
+                )
+            with profile_range("recsys.kvcache.allocate"):
+                kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(
+                    index_meta, lookup_res
+                )
 
-            # asynchronous kvdata onboard, overlapping with strip_cached and embedding lookup
-            self.dense_module.kvcache.onboard_launch(
-                index_meta, lookup_res, kvcache_metadata
-            )
+            # Async onboarding overlaps token stripping and embedding lookup.
+            with profile_range("recsys.kvcache.onboard_launch"):
+                self.dense_module.kvcache.onboard_launch(
+                    index_meta, lookup_res, kvcache_metadata
+                )
 
             old_cached_lengths = lookup_res.cached_lengths
-            striped_batch = self.strip_cached_tokens(
-                batch,
-                old_cached_lengths,
-            )
+            with profile_range("recsys.kvcache.strip"):
+                striped_batch = self.strip_cached_tokens(
+                    batch,
+                    old_cached_lengths,
+                )
 
             torch.cuda.nvtx.range_push("HSTU embedding")
-            embeddings = self.sparse_module(striped_batch.features)
-            torch.cuda.nvtx.range_pop()
+            try:
+                with profile_range("recsys.embedding.lookup"):
+                    embeddings = self.sparse_module(striped_batch.features)
+            finally:
+                torch.cuda.nvtx.range_pop()
 
             kvcache_info = (index_meta, lookup_res, kvcache_metadata)
             logits = self.dense_module.forward_with_kvcache(
@@ -167,17 +189,114 @@ class InferenceRankingGR(torch.nn.Module):
                 kvcache_info,
             )
 
+            if self.collect_cache_stats:
+                # Lookup metadata is already on CPU. Never copy GPU counters or
+                # synchronize a stream just to collect these optional statistics.
+                history = index_meta.seq_lengths
+                cached = lookup_res.cached_lengths
+                gpu_cached = lookup_res.gpu_cached_lengths
+                host_cached = lookup_res.host_cached_lengths
+                gpu_start = lookup_res.gpu_cached_start_indices
+                host_start = lookup_res.host_cached_start_indices
+                if all(
+                    tensor.device.type == "cpu"
+                    for tensor in (
+                        history,
+                        cached,
+                        gpu_cached,
+                        host_cached,
+                        gpu_start,
+                        host_start,
+                    )
+                ):
+                    reused = torch.minimum(cached.clamp_min(0), history)
+                    gpu_reused = (
+                        torch.minimum(gpu_start + gpu_cached, history)
+                        - gpu_start.clamp_min(0)
+                    ).clamp_min(0)
+                    host_reused = (
+                        torch.minimum(host_start + host_cached, history)
+                        - host_start.clamp_min(0)
+                    ).clamp_min(0)
+                    history_tokens = int(history.sum())
+                    cached_tokens = int(reused.sum())
+                    self.last_cache_stats.update(
+                        history_tokens=history_tokens,
+                        kv_cached_tokens=cached_tokens,
+                        kv_gpu_cached_tokens=int(gpu_reused.sum()),
+                        kv_host_cached_tokens=int(host_reused.sum()),
+                        kv_hit_rate=(
+                            cached_tokens / history_tokens if history_tokens else None
+                        ),
+                        kv_full_hit_requests=int(
+                            ((reused == history) & (history > 0)).sum()
+                        ),
+                        kv_partial_hit_requests=int(
+                            ((reused > 0) & (reused < history)).sum()
+                        ),
+                        kv_zero_hit_requests=int(((reused == 0) & (history > 0)).sum()),
+                        kv_empty_history_requests=int((history == 0).sum()),
+                        kv_cached_lengths=cached.tolist(),
+                        gpu_cached_lengths=gpu_cached.tolist(),
+                        host_cached_lengths=host_cached.tolist(),
+                    )
+                else:
+                    self.last_cache_stats["kv_stats_unavailable_reason"] = (
+                        "Lookup metadata is not on CPU; collection would synchronize."
+                    )
+                # GPU and host cached tokens overlap; only the merged count is
+                # the number of history tokens reused by this forward.
+                self.last_cache_stats.update(
+                    batch_size=batch.batch_size,
+                    embedding_keys=striped_batch.features.values().numel(),
+                    embedding_hit_rate=None,
+                    embedding_hit_rate_unavailable_reason=(
+                        "The embedding backend exposes no Python hit counter."
+                    ),
+                    **self.dense_module.last_cache_stats,
+                )
+                self.last_cache_stats.update(
+                    getattr(dynamic_collection, "last_cache_stats", {})
+                )
+
         return logits
 
     def forward_nokvcache(
         self,
         batch: HSTUBatch,
     ):
+        profile_range = (
+            torch.profiler.record_function if self.profile_cache else nullcontext
+        )
+        self.last_cache_stats = {}
+        self.dense_module.collect_cache_stats = self.collect_cache_stats
+        self.dense_module.profile_cache = self.profile_cache
+        dynamic_collection = getattr(
+            self.sparse_module, "_dynamic_embedding_collection", None
+        )
+        if hasattr(dynamic_collection, "collect_cache_stats"):
+            dynamic_collection.collect_cache_stats = self.collect_cache_stats
         with torch.inference_mode():
             torch.cuda.nvtx.range_push("HSTU embedding")
-            embeddings = self.sparse_module(batch.features)
-            torch.cuda.nvtx.range_pop()
+            try:
+                with profile_range("recsys.embedding.lookup"):
+                    embeddings = self.sparse_module(batch.features)
+            finally:
+                torch.cuda.nvtx.range_pop()
             logits = self.dense_module.forward_nokvcache(batch, embeddings)
+            if self.collect_cache_stats:
+                self.last_cache_stats.update(
+                    batch_size=batch.batch_size,
+                    embedding_keys=batch.features.values().numel(),
+                    embedding_hit_rate=None,
+                    embedding_hit_rate_unavailable_reason=(
+                        "The embedding backend exposes no Python hit counter."
+                    ),
+                    **self.dense_module.last_cache_stats,
+                )
+                self.last_cache_stats.update(
+                    getattr(dynamic_collection, "last_cache_stats", {})
+                )
 
         return logits
 

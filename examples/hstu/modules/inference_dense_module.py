@@ -14,6 +14,7 @@
 # limitations under the License.
 import math
 import os
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -139,6 +140,9 @@ class InferenceDenseModule(torch.nn.Module):
         mlp: Optional[torch.nn.Module] = None,
     ):
         super().__init__()
+        self.collect_cache_stats = False
+        self.profile_cache = False
+        self.last_cache_stats = {}
         self._device = torch.cuda.current_device()
         self._hstu_config = hstu_config
         self._task_config = task_config
@@ -340,6 +344,10 @@ class InferenceDenseModule(torch.nn.Module):
         total_history_lengths: torch.Tensor,
         kvcache_info: Tuple[KVIndexMeta, KVLookupResult, KVCacheMetadata],
     ):
+        profile_range = (
+            torch.profiler.record_function if self.profile_cache else nullcontext
+        )
+        self.last_cache_stats = {}
         with torch.inference_mode():
             (
                 kv_index_meta,
@@ -347,22 +355,30 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_metadata,
             ) = kvcache_info
 
-            jagged_data = self._hstu_block._preprocessor(
-                embeddings=embeddings,
-                batch=batch,
-                seq_start_position=kv_lookup_result.cached_lengths.cuda(),
-            )
-            jagged_data.scaling_seqlen = self._scaling_seqlen
+            with profile_range("recsys.dense.preprocess"):
+                jagged_data = self._hstu_block._preprocessor(
+                    embeddings=embeddings,
+                    batch=batch,
+                    seq_start_position=kv_lookup_result.cached_lengths.cuda(),
+                )
+                jagged_data.scaling_seqlen = self._scaling_seqlen
 
-            # The seqlen for attention kv data loading (from both kvcache [history] and direct input [canididates]).
-            kvcache_metadata.kv_seqlen_offsets = (
-                kvcache_metadata.total_history_offsets
-                + jagged_data.num_candidates_offsets
-            )
-            kvcache_metadata.kv_seqlens = (
-                kvcache_metadata.total_history_lengths + jagged_data.num_candidates
-            )
-            kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
+                # Attention reads both cached history and current candidates.
+                kvcache_metadata.kv_seqlen_offsets = (
+                    kvcache_metadata.total_history_offsets
+                    + jagged_data.num_candidates_offsets
+                )
+                kvcache_metadata.kv_seqlens = (
+                    kvcache_metadata.total_history_lengths + jagged_data.num_candidates
+                )
+                kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
+
+            num_tokens = jagged_data.values.shape[0]
+            if self.collect_cache_stats:
+                self.last_cache_stats.update(
+                    new_history_nnz=kvcache_metadata.new_history_nnz,
+                    dense_tokens=num_tokens,
+                )
 
             onboard_handle = kvcache_metadata.kv_onload_handle
             if (
@@ -374,37 +390,38 @@ class InferenceDenseModule(torch.nn.Module):
             ):
                 torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
                 try:
-                    self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                    with profile_range("recsys.kvcache.onboard_wait"):
+                        self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
                 finally:
                     torch.cuda.nvtx.range_pop()
 
             hstu_error: Optional[BaseException] = None
             try:
-                # num_tokens = batch.features.values().shape[0]
-                num_tokens = jagged_data.values.shape[0]
-                if self.use_cudagraph:
-                    self._hidden_states[:num_tokens, ...].copy_(
-                        jagged_data.values, non_blocking=True
-                    )
-                    copy_jagged_metadata(self._jagged_metadata, jagged_data)
-                    copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
+                # This inclusive range also covers graph input staging and
+                # layerwise onload waits inside predict, when enabled.
+                with profile_range("recsys.dense.hstu"):
+                    if self.use_cudagraph:
+                        self._hidden_states[:num_tokens, ...].copy_(
+                            jagged_data.values, non_blocking=True
+                        )
+                        copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                        copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
 
-                    hstu_output = self._hstu_block.predict(
-                        batch.batch_size,
-                        num_tokens,
-                        self._hidden_states,
-                        self._jagged_metadata,
-                        kvcache_metadata,
-                    )
-                    jagged_data.values = hstu_output
-                else:
-                    hstu_output = self._hstu_block.predict(
-                        batch.batch_size,
-                        num_tokens,
-                        jagged_data.values,
-                        jagged_data,
-                        kvcache_metadata,
-                    )
+                        hstu_output = self._hstu_block.predict(
+                            batch.batch_size,
+                            num_tokens,
+                            self._hidden_states,
+                            self._jagged_metadata,
+                            kvcache_metadata,
+                        )
+                    else:
+                        hstu_output = self._hstu_block.predict(
+                            batch.batch_size,
+                            num_tokens,
+                            jagged_data.values,
+                            jagged_data,
+                            kvcache_metadata,
+                        )
                     jagged_data.values = hstu_output
             except BaseException as err:
                 hstu_error = err
@@ -419,7 +436,8 @@ class InferenceDenseModule(torch.nn.Module):
                 ):
                     torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
                     try:
-                        self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                        with profile_range("recsys.kvcache.onboard_wait"):
+                            self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
                     except BaseException as wait_err:
                         if hstu_error is None:
                             raise
@@ -427,11 +445,16 @@ class InferenceDenseModule(torch.nn.Module):
                     finally:
                         torch.cuda.nvtx.range_pop()
 
-            self.kvcache.offload_try_wait()
-            self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)
+            with profile_range("recsys.kvcache.offload_try_wait"):
+                self.kvcache.offload_try_wait()
+            # Launch is submission cost; asynchronous transfer may outlive it.
+            with profile_range("recsys.kvcache.offload_launch"):
+                self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)
 
-            jagged_data = self._hstu_block._postprocessor(jagged_data)
-            jagged_item_logit = self._mlp(jagged_data.values)
+            with profile_range("recsys.dense.postprocess"):
+                jagged_data = self._hstu_block._postprocessor(jagged_data)
+            with profile_range("recsys.dense.head"):
+                jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit
 
@@ -440,38 +463,50 @@ class InferenceDenseModule(torch.nn.Module):
         batch: HSTUBatch,
         embeddings: Dict[str, JaggedTensor],
     ):
+        profile_range = (
+            torch.profiler.record_function if self.profile_cache else nullcontext
+        )
+        self.last_cache_stats = {}
         with torch.inference_mode():
-            jagged_data = self._hstu_block._preprocessor(
-                embeddings=embeddings,
-                batch=batch,
-            )
-            jagged_data.scaling_seqlen = self._scaling_seqlen
+            with profile_range("recsys.dense.preprocess"):
+                jagged_data = self._hstu_block._preprocessor(
+                    embeddings=embeddings,
+                    batch=batch,
+                )
+                jagged_data.scaling_seqlen = self._scaling_seqlen
 
-            # num_tokens = batch.features.values().shape[0]
             num_tokens = jagged_data.values.shape[0]
-            if self.use_cudagraph:
-                self._hidden_states[:num_tokens, ...].copy_(
-                    jagged_data.values, non_blocking=True
+            if self.collect_cache_stats:
+                self.last_cache_stats.update(
+                    new_history_nnz=None,
+                    dense_tokens=num_tokens,
                 )
-                copy_jagged_metadata(self._jagged_metadata, jagged_data)
-                hstu_output = self._hstu_block.predict(
-                    batch.batch_size,
-                    num_tokens,
-                    self._hidden_states,
-                    self._jagged_metadata,
-                    None,
-                )
-            else:
-                hstu_output = self._hstu_block.predict(
-                    batch.batch_size,
-                    num_tokens,
-                    jagged_data.values,
-                    jagged_data,
-                    None,
-                )
-            jagged_data.values = hstu_output
-            jagged_data = self._hstu_block._postprocessor(jagged_data)
-            jagged_item_logit = self._mlp(jagged_data.values)
+            with profile_range("recsys.dense.hstu"):
+                if self.use_cudagraph:
+                    self._hidden_states[:num_tokens, ...].copy_(
+                        jagged_data.values, non_blocking=True
+                    )
+                    copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                    hstu_output = self._hstu_block.predict(
+                        batch.batch_size,
+                        num_tokens,
+                        self._hidden_states,
+                        self._jagged_metadata,
+                        None,
+                    )
+                else:
+                    hstu_output = self._hstu_block.predict(
+                        batch.batch_size,
+                        num_tokens,
+                        jagged_data.values,
+                        jagged_data,
+                        None,
+                    )
+                jagged_data.values = hstu_output
+            with profile_range("recsys.dense.postprocess"):
+                jagged_data = self._hstu_block._postprocessor(jagged_data)
+            with profile_range("recsys.dense.head"):
+                jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit
 

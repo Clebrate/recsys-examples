@@ -46,6 +46,8 @@ try:
         ):
             super().__init__()
             self._is_weighted = is_weighted
+            self.collect_cache_stats = False
+            self.last_cache_stats = {}
             self.embeddings: torch.nn.ModuleDict = torch.nn.ModuleDict()
             self._embedding_configs = configs
             if device is None:
@@ -182,6 +184,12 @@ try:
             Returns:
                 Dict[str, JaggedTensor]
             """
+            self.last_cache_stats = {}
+            if self.collect_cache_stats:
+                lookup_stats = []
+                dynamic_keys = 0
+                weighted_gpu_hit_rate = 0.0
+                missing_stats = False
             result_embeddings: Dict[str, torch.Tensor] = dict()
             feature_dict = features.to_dict()
             for i, embedding in enumerate(self.embeddings.values()):
@@ -195,11 +203,64 @@ try:
                             device=self._device,
                             dtype=config.data_type,
                         )
+                    elif self.collect_cache_stats:
+                        num_keys = keys.numel()
+                        dynamic_keys += num_keys
+                        layer = getattr(embedding, "emb_layer", None)
+                        getter = getattr(layer, "get_last_lookup_stats", None)
+                        setter = getattr(layer, "set_collect_lookup_stats", None)
+                        hit_rates = None
+                        if getter is not None and setter is not None:
+                            setter(True)
+                            try:
+                                res = embedding(keys.contiguous())
+                                recorded_keys, hit_rates = getter()
+                            finally:
+                                setter(False)
+                            if recorded_keys != num_keys or not hit_rates:
+                                raise RuntimeError(
+                                    "NVEMB lookup stats do not match this lookup"
+                                )
+                            hit_rates = [float(rate) for rate in hit_rates]
+                            weighted_gpu_hit_rate += num_keys * hit_rates[0]
+                        else:
+                            res = embedding(keys.contiguous())
+                            missing_stats = True
+                        lookup_stats.append(
+                            {
+                                "table": self._embedding_configs[i].name,
+                                "feature": feature_name,
+                                "num_keys": num_keys,
+                                "hit_rates": hit_rates,
+                            }
+                        )
                     else:
                         res = embedding(keys.contiguous())
                     result_embeddings[feature_name] = JaggedTensor(
                         values=res, lengths=f.lengths()
                     )
+
+            if self.collect_cache_stats:
+                # These are query-weighted backend float rates for dynamic
+                # tables. Do not turn them into purported integer hit counts.
+                unavailable_reason = None
+                if missing_stats:
+                    unavailable_reason = (
+                        "NVEMB binding has no optional lookup stats API."
+                    )
+                elif not dynamic_keys:
+                    unavailable_reason = "No dynamic embedding keys were queried."
+                self.last_cache_stats = {
+                    "embedding_dynamic_keys": dynamic_keys,
+                    "embedding_lookup_stats": lookup_stats,
+                    "embedding_hit_rate": (
+                        weighted_gpu_hit_rate / dynamic_keys
+                        if dynamic_keys and not missing_stats
+                        else None
+                    ),
+                    "embedding_hit_rate_scope": "dynamic_tables_gpu_tier",
+                    "embedding_hit_rate_unavailable_reason": unavailable_reason,
+                }
 
             return result_embeddings
 
