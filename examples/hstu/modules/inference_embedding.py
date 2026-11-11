@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from modules.inference_cache_budget import validate_bytes
 from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -211,6 +212,7 @@ def create_embedding_collection(configs, backend, use_static: bool = False, **kw
             device=torch.cuda.current_device(),
             use_gpu_only=use_static,
             gpu_cache_ratio=kwargs.get("gpu_cache_ratio", 0.1),
+            gpu_cache_bytes=kwargs.get("gpu_cache_bytes"),
             is_weighted=kwargs.get("is_weighted", False),
             sparse_shareables=sparse_shareables,
         )
@@ -232,6 +234,7 @@ class InferenceEmbedding(torch.nn.Module):
         embedding_configs: List[InferenceEmbeddingConfig],
         embedding_backend: Optional[EmbeddingBackend] = None,
         sparse_shareables=None,
+        gpu_cache_bytes: Optional[int] = None,
     ):
         super(InferenceEmbedding, self).__init__()
 
@@ -253,6 +256,10 @@ class InferenceEmbedding(torch.nn.Module):
             if embedding_backend is None
             else embedding_backend
         )
+        if gpu_cache_bytes is not None:
+            validate_bytes(gpu_cache_bytes, "gpu_cache_bytes")
+            if self.dynamic_emb_backend != EmbeddingBackend.NVEMB:
+                raise ValueError("Embedding cache budget requires the NVEMB backend")
         self._dynamic_embedding_collection = create_embedding_collection(
             configs=self.dynamic_embedding_configs,
             backend=self.dynamic_emb_backend,
@@ -260,6 +267,7 @@ class InferenceEmbedding(torch.nn.Module):
             ps=None,
             enable_cache=False,
             gpu_cache_ratio=0.05,
+            gpu_cache_bytes=gpu_cache_bytes,
             sparse_shareables=sparse_shareables,
         )
 
@@ -294,7 +302,7 @@ class InferenceEmbedding(torch.nn.Module):
 
         if len(self.static_embedding_configs) > 0:
             self.load_state_dict(model_state_dict, strict=False)
-        else:
+        elif self.dynamic_emb_backend == EmbeddingBackend.DYNAMICEMB:
             for k in model_state_dict:
                 if k.startswith(
                     "_embedding_collection._data_parallel_embedding_collection.embeddings."

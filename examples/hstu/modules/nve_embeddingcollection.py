@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 from typing import Dict, List, Optional
 
 import torch
+from modules.inference_cache_budget import split_table_cache_bytes, validate_bytes
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import get_embedding_names_by_table
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -40,29 +42,62 @@ try:
             gpu_cache_ratio: float = 0.01,
             is_weighted: bool = False,
             sparse_shareables=None,
+            gpu_cache_bytes: Optional[int] = None,
         ):
             super().__init__()
             self._is_weighted = is_weighted
             self.embeddings: torch.nn.ModuleDict = torch.nn.ModuleDict()
             self._embedding_configs = configs
-            self._device: torch.device = (
-                device if device is not None else torch.cuda.current_device()
-            )
+            if device is None:
+                self._device = torch.device("cuda", torch.cuda.current_device())
+            elif isinstance(device, int):
+                self._device = torch.device("cuda", device)
+            else:
+                self._device = torch.device(device)
             self._lengths_per_embedding: List[int] = []
+            self._owned_parameter_servers = {}
 
-            table_names = set()
-            for embedding_config in configs:
-                if embedding_config.name in table_names:
-                    raise ValueError(f"Duplicate table name {embedding_config.name}")
-                table_names.add(embedding_config.name)
-                if not use_gpu_only:
-                    gpu_cache_size = int(
-                        embedding_config.num_embeddings * gpu_cache_ratio
+            if not math.isfinite(gpu_cache_ratio) or not 0 < gpu_cache_ratio <= 1:
+                raise ValueError("gpu_cache_ratio must be finite and in (0, 1]")
+            if gpu_cache_bytes is not None:
+                validate_bytes(gpu_cache_bytes, "gpu_cache_bytes")
+                if use_gpu_only:
+                    raise ValueError(
+                        "Cache byte budgets apply only to hierarchical tables"
                     )
-                    gpu_cache_size *= embedding_config.embedding_dim
-                    gpu_cache_size *= torch.tensor(
-                        [], dtype=embedding_config.data_type
-                    ).element_size()
+            if len({config.name for config in configs}) != len(configs):
+                raise ValueError("Duplicate embedding table names")
+
+            row_bytes = [
+                config.embedding_dim
+                * torch.empty((), dtype=config.data_type).element_size()
+                for config in configs
+            ]
+            table_bytes = [
+                config.num_embeddings * row for config, row in zip(configs, row_bytes)
+            ]
+            if gpu_cache_bytes is not None:
+                gpu_sizes = split_table_cache_bytes(
+                    gpu_cache_bytes, table_bytes, row_bytes
+                )
+            else:
+                gpu_sizes = [
+                    int(config.num_embeddings * gpu_cache_ratio) * row
+                    for config, row in zip(configs, row_bytes)
+                ]
+            if not use_gpu_only and any(size <= 0 for size in gpu_sizes):
+                raise ValueError(
+                    "GPU cache must hold at least one row per dynamic table"
+                )
+            self.gpu_cache_bytes_by_table = (
+                dict(zip((config.name for config in configs), gpu_sizes))
+                if not use_gpu_only
+                else {}
+            )
+
+            for table_idx, embedding_config in enumerate(configs):
+                if not use_gpu_only:
+                    gpu_cache_size = gpu_sizes[table_idx]
                     storage = (
                         sparse_shareables[embedding_config.name]
                         if sparse_shareables
@@ -70,6 +105,8 @@ try:
                             0, embedding_config.embedding_dim, torch.float32
                         )
                     )
+                    if not sparse_shareables:
+                        self._owned_parameter_servers[embedding_config.name] = storage
                     self.embeddings[embedding_config.name] = NVEmbedding(
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
@@ -77,6 +114,7 @@ try:
                         gpu_cache_size=gpu_cache_size,
                         host_cache_size=0,
                         optimize_for_training=False,
+                        device=self._device,
                         **hierarchical_constructor_kwargs(storage),
                     )
                 else:
@@ -85,6 +123,7 @@ try:
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
                         optimize_for_training=False,
+                        device=self._device,
                         **gpu_only_constructor_kwargs(),
                     )
 
@@ -108,7 +147,9 @@ try:
             pass
 
         def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
-            pass
+            # Shared stores are loaded by their owner (e.g. the Triton launcher).
+            # Standalone inference owns its stores and must load actual values.
+            self.load_checkpoint_into_ps(self._owned_parameter_servers, checkpoint_dir)
 
         @classmethod
         def load_checkpoint_into_ps(
@@ -146,7 +187,16 @@ try:
             for i, embedding in enumerate(self.embeddings.values()):
                 for feature_name in self._feature_names[i]:
                     f = feature_dict[feature_name]
-                    res = embedding(f.values())
+                    keys = f.values()
+                    if keys.numel() == 0:
+                        config = self._embedding_configs[i]
+                        res = torch.empty(
+                            (0, config.embedding_dim),
+                            device=self._device,
+                            dtype=config.data_type,
+                        )
+                    else:
+                        res = embedding(keys.contiguous())
                     result_embeddings[feature_name] = JaggedTensor(
                         values=res, lengths=f.lengths()
                     )
