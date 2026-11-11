@@ -208,6 +208,7 @@ class FlexKVStorage(HostKVStorageBase):
         self._registered: bool = False
         self._adapter = FlexKVClientAdapter(mode, server_addr, server_port)
         self._client = None
+        self._no_host_capacity = False
         self._ready = False
         self._page_offsets: Optional[torch.Tensor] = None
         self._layerwise_eventfd_sender: Optional[FlexKVLayerwiseEventfdSender] = None
@@ -223,6 +224,9 @@ class FlexKVStorage(HostKVStorageBase):
 
         # Initialize FlexKV client only after GPU cache table is available.
         self._init_client()
+        if self._no_host_capacity:
+            self._ready = True
+            return
 
         first_table = self._gpu_cache_table_list[0]
         device_id = int(
@@ -273,8 +277,10 @@ class FlexKVStorage(HostKVStorageBase):
         self._ready = True
 
     def _init_client(self) -> None:
-        if self._client is not None:
+        if self._client is not None or self._no_host_capacity:
             return
+        # FlexKV reads this variable while importing its global configuration.
+        os.environ.setdefault("FLEXKV_ENABLE_MPS", "1" if self.enable_mps else "0")
         try:
             from flexkv.common.config import (
                 GLOBAL_CONFIG_FROM_ENV,
@@ -295,10 +301,10 @@ class FlexKVStorage(HostKVStorageBase):
             dtype=self.dtype,
         )
         cache_cfg_kwargs: Dict[str, Any] = {"tokens_per_block": self.page_size}
-        # Configure CPU cache sizes if specified.
-        if self.num_cpu_blocks > 0:
+        # Zero is an explicit capacity, not a request for the SDK default.
+        if self.num_cpu_blocks >= 0:
             cache_cfg_kwargs["num_cpu_blocks"] = self.num_cpu_blocks
-        if self.num_local_blocks > 0:
+        if self.num_local_blocks >= 0:
             cache_cfg_kwargs["num_local_blocks"] = self.num_local_blocks
         if self.num_tmp_cpu_blocks > 0:
             cache_cfg_kwargs["num_tmp_cpu_blocks"] = self.num_tmp_cpu_blocks
@@ -317,6 +323,13 @@ class FlexKVStorage(HostKVStorageBase):
             update_default_config_from_user_config(
                 RankInfo(model_config=model_cfg), cache_cfg, user_cfg
             )
+        if cache_cfg.num_cpu_blocks == 0:
+            if cache_cfg.enable_ssd or cache_cfg.enable_remote:
+                raise ValueError("FlexKV SSD/remote tiers require nonzero CPU staging capacity")
+            # The SDK rejects a zero-block radix pool. Honor the existing size
+            # setting here: GPU KV remains active, with no host restore/offload.
+            self._no_host_capacity = True
+            return
         if isinstance(self.enable_layerwise, str):
             self.enable_layerwise = self.enable_layerwise.strip().lower() in {
                 "1",
@@ -403,6 +416,14 @@ class FlexKVStorage(HostKVStorageBase):
         )
 
     def lookup_kvcache(self, index_meta: KVIndexMeta) -> KVLookupResult:
+        if self._no_host_capacity:
+            zeros = torch.zeros_like(index_meta.user_ids, dtype=torch.int32)
+            return KVLookupResult(
+                user_ids=index_meta.user_ids,
+                host_cached_start_indices=zeros,
+                host_cached_lengths=zeros,
+                extra={"backend": "flexkv", "task_ids": [-1] * zeros.numel()},
+            )
         if getattr(index_meta, "namespaces", None) is None:
             index_meta.namespaces = [
                 [f"uid:{int(uid)}"]
@@ -474,6 +495,11 @@ class FlexKVStorage(HostKVStorageBase):
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata,
     ) -> HostKVTaskHandle:
+        if self._no_host_capacity:
+            return HostKVTaskHandle(
+                backend=HostKVBackend.FLEXKV, user_ids=index_meta.user_ids,
+                handle=None, status=HostKVTaskStatus.SKIPPED,
+            )
         # 1. Filter users that need onboard.
         # 2. Acquire a layerwise eventfd counter.
         # 3. Build the onload handle and finish callback.
@@ -668,6 +694,11 @@ class FlexKVStorage(HostKVStorageBase):
                 handle.release_counter()
 
     def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        if self._no_host_capacity:
+            return HostKVTaskHandle(
+                backend=HostKVBackend.FLEXKV, user_ids=index_meta.user_ids,
+                handle=None, status=HostKVTaskStatus.SKIPPED,
+            )
         if getattr(index_meta, "namespaces", None) is None:
             index_meta.namespaces = [
                 [f"uid:{int(uid)}"]
@@ -700,6 +731,8 @@ class FlexKVStorage(HostKVStorageBase):
         index_meta: Optional[KVIndexMeta] = None,
         kvcache_metadata: Optional[KVCacheMetadata] = None,
     ) -> Optional[HostKVTaskHandle]:
+        if self._no_host_capacity:
+            return None
         assert index_meta is not None
         assert torch.equal(offload_user_ids, index_meta.user_ids), (
             "offload_user_ids must match index_meta.user_ids, "
