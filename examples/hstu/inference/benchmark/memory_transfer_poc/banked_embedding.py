@@ -11,7 +11,10 @@ bank span. Retire those KV pages BEFORE constructing the NVE banks. After
 draining requests and FlexKV, retire a group here, then restore its KV pages.
 For the reverse direction, retire empty KV pages first, then restore the group.
 
-The primary policy is key % original_bank_count. By default retired partitions
+The primary policy hashes each key with the SplitMix64 finalizer, then takes
+its unsigned high 32 bits modulo the original bank count. This avoids coupling
+bank routing to NVE's key % num_sets mapping. Raw lookup keys are unchanged.
+By default retired partitions
 route to the first live bank, whose misses read the real NVE PS and populate
 that bank. Active primary mappings stay unchanged. Restoring a partition can
 leave duplicate cached entries in the fallback bank; no caches are cleared.
@@ -33,6 +36,19 @@ _HIT_COUNT_SOURCE = (
     "gpu_hits/ps_hits are llround(NVE float table hit rate * query count) per bank batch; "
     "queries include duplicate keys, not raw counters or unique MGET miss counts"
 )
+
+
+def primary_bank_ids(keys: torch.Tensor, bank_count: int) -> torch.Tensor:
+    """Stable partitions using the high bits of the SplitMix64 finalizer.
+
+    Torch int64 multiplication wraps modulo 2**64. Signed constants encode
+    0xbf58476d1ce4e5b9 and 0x94d049bb133111eb; masks turn arithmetic shifts
+    into logical shifts. Hash only the route, never the key passed to NVE/PS.
+    """
+    mixed = (keys ^ ((keys >> 30) & ((1 << 34) - 1))) * -4658895280553007687
+    mixed = (mixed ^ ((mixed >> 27) & ((1 << 37) - 1))) * -7723592293110705685
+    mixed = mixed ^ ((mixed >> 31) & ((1 << 33) - 1))
+    return ((mixed >> 32) & 0xffffffff).remainder(bank_count)
 
 
 def tensor_span(tensor: torch.Tensor):
@@ -98,7 +114,7 @@ class BankedNVEEmbedding(torch.nn.Module):
         # Primary partitions never change. Only retired partitions can borrow
         # the first live bank; this is an explicit policy, not retained hits.
         with profile_range("recsys.embedding.banked.route_and_gather"):
-            primary_routes = torch.remainder(keys, self.bank_count)
+            primary_routes = primary_bank_ids(keys, self.bank_count)
             routes = self._bank_routes[primary_routes]
         stream_ptr = torch.cuda.current_stream(self.device).cuda_stream
         for bank_id in range(self.bank_count):
@@ -176,7 +192,7 @@ class BankedNVEEmbedding(torch.nn.Module):
     def stats(self):
         result = self._backend.stats()
         result["hit_count_source"] = _HIT_COUNT_SOURCE
-        result["primary_routing_policy"] = "torch.remainder(key, original_bank_count)"
+        result["primary_routing_policy"] = "splitmix64_finalizer(key).unsigned_high32 % original_bank_count"
         result["retired_policy"] = self.retired_policy
         result["physical_bank_for_primary_partition"] = self._route_ids[:]
         result["restore_policy"] = "original primary mapping resumes; fallback-bank duplicates are not cleared"
