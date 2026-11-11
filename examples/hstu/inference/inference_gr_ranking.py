@@ -137,6 +137,7 @@ def get_inference_hstu_model(
     embedding_backend=None,
     cache_budget_bytes=None,
     kv_cache_ratio=None,
+    kv_cache_extra_configs=None,
 ):
     kv_cache_bytes = embedding_cache_bytes = None
     if cache_budget_bytes is not None or kv_cache_ratio is not None:
@@ -226,7 +227,9 @@ def get_inference_hstu_model(
         "offload_timeout_ms": 100.0,
         "offload_mode": "lazy",
     }
-    kv_cache_config = get_kvcache_config(**kvcache_args)
+    kv_cache_config = get_kvcache_config(
+        **kvcache_args, extra_configs=kv_cache_extra_configs
+    )
 
     ranking_args = RankingArgs()
     task_config = RankingConfig(

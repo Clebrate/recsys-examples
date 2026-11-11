@@ -1,0 +1,16 @@
+# Small inference configuration matching the existing 27K training example.
+# A checkpoint must have the same network dimensions; random weights are smoke only.
+DatasetArgs.dataset_name = 'kuairand-27k'
+DatasetArgs.max_history_seqlen = 8000
+DatasetArgs.max_num_candidates = 256
+DatasetArgs.shuffle = False
+
+NetworkArgs.num_layers = 1
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 128
+NetworkArgs.kv_channels = 128
+NetworkArgs.dtype_str = 'bfloat16'
+
+RankingArgs.prediction_head_arch = [512, 8]
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
