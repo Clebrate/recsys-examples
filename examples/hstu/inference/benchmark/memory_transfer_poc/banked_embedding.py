@@ -23,6 +23,8 @@ The Python routing and real NVE CPU misses add overhead; this is a mechanism
 POC, not a performance-equivalent replacement for the normal NVEmbedding.
 """
 
+import math
+import time
 from contextlib import nullcontext
 from typing import Sequence
 
@@ -86,6 +88,7 @@ class BankedNVEEmbedding(torch.nn.Module):
         self._route_ids = list(range(self.bank_count))
         self._collect_lookup_stats = False
         self.profile = False
+        self.mget_wait_ms = 0.0
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         elif isinstance(device, int):
@@ -105,6 +108,8 @@ class BankedNVEEmbedding(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, keys: torch.Tensor, *, populate: bool = True) -> torch.Tensor:
+        if not math.isfinite(self.mget_wait_ms) or self.mget_wait_ms < 0:
+            raise ValueError("mget_wait_ms must be finite and nonnegative")
         if keys.dtype != torch.int64 or keys.ndim != 1 or keys.device != self.device:
             raise ValueError("Expected a CUDA int64 key vector on the bank device")
         result = torch.empty((keys.numel(), self.embedding_size), dtype=torch.float32, device=self.device)
@@ -135,6 +140,16 @@ class BankedNVEEmbedding(torch.nn.Module):
                 bank_results.append(stats)
                 for field in totals:
                     totals[field] += stats[field]
+        # One logical lookup combines every bank's misses. This adds CPU wall
+        # time only; it issues no Redis request and models no per-key latency.
+        totals["simulated_mget_calls"] = int(self.mget_wait_ms > 0 and totals["ps_hits"] > 0)
+        totals["requested_wait_ms"] = self.mget_wait_ms if totals["simulated_mget_calls"] else 0.0
+        totals["actual_wait_ms"] = 0.0
+        if totals["simulated_mget_calls"]:
+            with profile_range("recsys.embedding.simulated_mget_wait"):
+                wait_started = time.perf_counter()
+                time.sleep(self.mget_wait_ms / 1000.0)
+                totals["actual_wait_ms"] = (time.perf_counter() - wait_started) * 1000.0
         totals["gpu_hit_rate"] = totals["gpu_hits"] / totals["queries"] if totals["queries"] else 0.0
         totals["banks"] = bank_results
         totals["hit_count_source"] = _HIT_COUNT_SOURCE
@@ -191,8 +206,15 @@ class BankedNVEEmbedding(torch.nn.Module):
 
     def stats(self):
         result = self._backend.stats()
+        result["mget_wait_ms"] = self.mget_wait_ms
+        result["mget_wait_model"] = "One added CPU sleep per logical lookup with any PS hit; no Redis request"
         result["hit_count_source"] = _HIT_COUNT_SOURCE
         result["primary_routing_policy"] = "splitmix64_finalizer(key).unsigned_high32 % original_bank_count"
+        result["primary_hash_formula"] = (
+            "z=uint64(key); z=(z^(z>>30))*0xbf58476d1ce4e5b9; "
+            "z=(z^(z>>27))*0x94d049bb133111eb; z=z^(z>>31); "
+            "primary=(z>>32)%N; all products modulo 2**64, N fixed at construction"
+        )
         result["retired_policy"] = self.retired_policy
         result["physical_bank_for_primary_partition"] = self._route_ids[:]
         result["restore_policy"] = "original primary mapping resumes; fallback-bank duplicates are not cleared"
