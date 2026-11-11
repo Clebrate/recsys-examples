@@ -27,6 +27,8 @@
 namespace py = pybind11;
 using Clock = std::chrono::steady_clock;
 
+void bind_banked_embedding(py::module_& module);
+
 namespace {
 
 void checked(cudaError_t error) {
@@ -366,6 +368,7 @@ class BankTransfer {
 
 PYBIND11_MODULE(memory_transfer_poc, module) {
   module.doc() = "NVE backing-to-tensor interface spike; no HSTU or FlexKV integration";
+  bind_banked_embedding(module);
   py::class_<BankTransfer>(module, "BankTransfer")
       .def(py::init<size_t, int64_t, int64_t, int>(), py::arg("bank_bytes"), py::arg("row_bytes"),
            py::arg("warm_rows"), py::arg("device") = 0)

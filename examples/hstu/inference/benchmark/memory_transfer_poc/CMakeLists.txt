@@ -45,7 +45,7 @@ find_path(NVE_JSON_INCLUDE_DIR nlohmann/json.hpp
   HINTS "${NVE_ROOT}/third_party/json/single_include"
         "${NVE_ROOT}/third_party/json/include" REQUIRED)
 
-Python3_add_library(memory_transfer_poc MODULE bindings.cpp)
+Python3_add_library(memory_transfer_poc MODULE bindings.cpp banked_embedding_bindings.cpp)
 target_compile_features(memory_transfer_poc PRIVATE cxx_std_17)
 target_compile_definitions(memory_transfer_poc PRIVATE NVE_CACHE_LINE_SIZE=${NVE_CACHE_LINE_SIZE})
 target_include_directories(memory_transfer_poc PRIVATE
