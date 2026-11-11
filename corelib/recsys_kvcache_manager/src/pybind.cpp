@@ -60,6 +60,12 @@ PYBIND11_MODULE(kvcache_cpp, m) {
     .def("allocate", &kvcache::GPUKVCacheManagerImpl::allocate)
     .def("evict", &kvcache::GPUKVCacheManagerImpl::evict)
     .def("evict_all", &kvcache::GPUKVCacheManagerImpl::evict_all)
+    .def("retire_empty_pages", &kvcache::GPUKVCacheManagerImpl::retire_empty_pages,
+         py::arg("first_page"), py::arg("num_pages"))
+    .def("restore_pages", &kvcache::GPUKVCacheManagerImpl::restore_pages,
+         py::arg("first_page"), py::arg("num_pages"))
+    .def("page_stats", &kvcache::GPUKVCacheManagerImpl::page_stats)
+    .def("page_snapshot", &kvcache::GPUKVCacheManagerImpl::page_snapshot)
     .def("revoke_onboard_pages", &kvcache::GPUKVCacheManagerImpl::revoke_onboard_pages)
     .def("check_for_offload", &kvcache::GPUKVCacheManagerImpl::check_for_offload)
     .def("acquire_offload_pages", &kvcache::GPUKVCacheManagerImpl::acquire_offload_pages)

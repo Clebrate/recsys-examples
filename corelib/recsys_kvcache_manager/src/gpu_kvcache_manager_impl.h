@@ -33,7 +33,9 @@
 #include <list>
 #include <memory>
 #include <queue>
+#include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -63,6 +65,16 @@ public:
     void evict_offloaded(int64_t uid);
     void evict_all();
     bool retain(int64_t uid);
+
+    // Metadata-only capacity changes. The caller must stop requests and drain
+    // inference/onboard/offload work before transferring ownership of backing.
+    // The registered tensor extent (num_primary_cache_pages) never changes.
+    void retire_empty_pages(int64_t first_page, int64_t num_pages);
+    void restore_pages(int64_t first_page, int64_t num_pages);
+    std::unordered_map<std::string, int64_t> page_stats() const;
+    // Free pages in allocation order, retired page IDs, and copied user page IDs.
+    std::tuple<std::vector<int64_t>, std::vector<int64_t>,
+               std::unordered_map<int64_t, std::vector<int>>> page_snapshot() const;
 
     std::vector<int> &
     alloc_single_sequence(int64_t uid, int new_total_length,
@@ -131,6 +143,9 @@ public:
 public:
     uint16_t *cache_table;
     at::Device device;  // check for c10::Device
+
+private:
+    std::unordered_set<int64_t> retired_pages_;
 };
 
 } // namespace kvcache

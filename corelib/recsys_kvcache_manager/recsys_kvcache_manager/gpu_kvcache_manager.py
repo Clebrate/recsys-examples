@@ -36,6 +36,7 @@ class DeviceKVCache:
         max_sequence_length: int,
         dtype: torch.dtype,
         device_idx: int,
+        external_cache_tensor: Optional[torch.Tensor] = None,
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -49,18 +50,36 @@ class DeviceKVCache:
         self.dtype = dtype
         self.device_idx = device_idx
 
-        self.gpu_kvcache_tensor: torch.Tensor = torch.empty(
-            [
-                self.num_layers,
-                self.num_primary_cache_pages,
-                2,  # k/v
-                self.page_size,
-                self.num_heads,
-                self.head_dim,
-            ],
-            dtype=self.dtype,
-            device=self.device_idx,
+        cache_shape = (
+            self.num_layers,
+            self.num_primary_cache_pages,
+            2,  # k/v
+            self.page_size,
+            self.num_heads,
+            self.head_dim,
         )
+        if external_cache_tensor is None:
+            self.gpu_kvcache_tensor = torch.empty(
+                cache_shape, dtype=self.dtype, device=self.device_idx
+            )
+        else:
+            if not isinstance(external_cache_tensor, torch.Tensor):
+                raise TypeError("external_cache_tensor must be a torch.Tensor")
+            if tuple(external_cache_tensor.shape) != cache_shape:
+                raise ValueError(
+                    f"external_cache_tensor shape must be {cache_shape}, "
+                    f"got {tuple(external_cache_tensor.shape)}"
+                )
+            if external_cache_tensor.dtype != self.dtype:
+                raise ValueError(f"external_cache_tensor dtype must be {self.dtype}")
+            if external_cache_tensor.device != torch.device("cuda", self.device_idx):
+                raise ValueError(
+                    f"external_cache_tensor must be on cuda:{self.device_idx}"
+                )
+            if not external_cache_tensor.is_contiguous():
+                raise ValueError("external_cache_tensor must be contiguous")
+            # Keep the exact tensor and its owner alive; never copy its backing.
+            self.gpu_kvcache_tensor = external_cache_tensor
         self.gpu_kvcache_tables = list(self.gpu_kvcache_tensor.unbind(dim=0))
         self.impl_ = GPUKVCacheManagerImpl(
             self.num_layers,
@@ -135,6 +154,31 @@ class DeviceKVCache:
 
     def evict_all(self) -> None:
         self.impl_.evict_all()
+
+    def retire_empty_pages(self, first_page: int, num_pages: int) -> None:
+        """Remove an entirely free page range without changing tensor layout.
+
+        Stop requests and drain inference/onboard/offload work first. Only after
+        this succeeds may another cache overwrite the range's backing.
+        """
+        self.impl_.retire_empty_pages(first_page, num_pages)
+
+    def restore_pages(self, first_page: int, num_pages: int) -> None:
+        """Restore a retired range after its other owner has drained and released it."""
+        self.impl_.restore_pages(first_page, num_pages)
+
+    def page_stats(self) -> dict:
+        """Return total, active, free, used, and retired page counts."""
+        return self.impl_.page_stats()
+
+    def page_snapshot(self) -> dict:
+        """Copy page ownership for validation; does not read or copy KV payload."""
+        free_pages, retired_pages, user_pages = self.impl_.page_snapshot()
+        return {
+            "free_pages": free_pages,
+            "retired_pages": retired_pages,
+            "user_pages": user_pages,
+        }
 
     # debug use interface. Use `paged_kvcache_ops.append_kvcache` directly.
     def put(

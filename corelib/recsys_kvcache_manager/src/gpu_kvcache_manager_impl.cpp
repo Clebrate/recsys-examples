@@ -21,6 +21,7 @@
 #include "gpu_kvcache_manager_impl.h"
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
 #include <utility>
 
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
@@ -110,16 +111,20 @@ std::vector<at::Tensor> GPUKVCacheManagerImpl::lookup(at::Tensor uids) {
 
 
 int64_t GPUKVCacheManagerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
-    int num_offloading_uids = _uid_offload_lock.size();
     for (auto it = std::begin(_lru_list); it != std::end(_lru_list); ++it) {
         if (_uid_offload_lock.find((int64_t)*it) != _uid_offload_lock.end())
+            continue;
+        if (_uid_inference_lock.find((int64_t)*it) != _uid_inference_lock.end())
             continue;
         if (extra_freezed_uids.find((int64_t)*it) != extra_freezed_uids.end())
             continue;
         return *it;
     }
-    if (num_offloading_uids == 0) assert(false);
-    return _lru_list.front();
+    TORCH_CHECK(false, "Insufficient active KV pages: no evictable user; free=",
+                _empty_pages.size(), ", active=",
+                num_primary_cache_pages - retired_pages_.size(),
+                ", retired=", retired_pages_.size(),
+                ". Reduce the request working set or restore retired pages.");
 };
 
 void GPUKVCacheManagerImpl::evict(int64_t uid) {
@@ -177,9 +182,81 @@ void GPUKVCacheManagerImpl::evict_all()
     _uid_offload_lock.clear();
     total_offloaded_pages = 0;
 
-    for (int page_id = 0; page_id < this->num_primary_cache_pages; page_id++)
-        _empty_pages.push(page_id);
+    for (int page_id = 0; page_id < this->num_primary_cache_pages; page_id++) {
+        if (retired_pages_.count(page_id) == 0) _empty_pages.push(page_id);
+    }
 };
+
+void GPUKVCacheManagerImpl::retire_empty_pages(int64_t first_page, int64_t num_pages) {
+    TORCH_CHECK(first_page >= 0 && num_pages > 0 &&
+                first_page <= num_primary_cache_pages &&
+                num_pages <= num_primary_cache_pages - first_page,
+                "Invalid KV page retirement range");
+    auto remaining = _empty_pages;
+    std::unordered_set<int64_t> free_pages;
+    while (!remaining.empty()) {
+        free_pages.insert(remaining.front());
+        remaining.pop();
+    }
+    // Validate the complete range before changing either ownership or queue.
+    for (int64_t page = first_page; page < first_page + num_pages; ++page) {
+        TORCH_CHECK(retired_pages_.count(page) == 0, "KV page ", page, " is already retired");
+        TORCH_CHECK(free_pages.count(page) != 0, "Cannot retire live KV page ", page,
+                    "; retire_empty_pages does not migrate or evict user data");
+    }
+    auto retired = retired_pages_;
+    for (int64_t page = first_page; page < first_page + num_pages; ++page) retired.insert(page);
+    auto old_queue = _empty_pages;
+    while (!old_queue.empty()) {
+        const auto page = old_queue.front();
+        old_queue.pop();
+        if (page < first_page || page >= first_page + num_pages) remaining.push(page);
+    }
+    retired_pages_.swap(retired);
+    _empty_pages.swap(remaining);
+}
+
+void GPUKVCacheManagerImpl::restore_pages(int64_t first_page, int64_t num_pages) {
+    TORCH_CHECK(first_page >= 0 && num_pages > 0 &&
+                first_page <= num_primary_cache_pages &&
+                num_pages <= num_primary_cache_pages - first_page,
+                "Invalid KV page restoration range");
+    for (int64_t page = first_page; page < first_page + num_pages; ++page) {
+        TORCH_CHECK(retired_pages_.count(page) != 0, "KV page ", page, " is not retired");
+    }
+    auto restored_queue = _empty_pages;
+    auto retired = retired_pages_;
+    for (int64_t page = first_page; page < first_page + num_pages; ++page) {
+        restored_queue.push(page);
+        retired.erase(page);
+    }
+    retired_pages_.swap(retired);
+    _empty_pages.swap(restored_queue);
+}
+
+std::unordered_map<std::string, int64_t> GPUKVCacheManagerImpl::page_stats() const {
+    const int64_t active = static_cast<int64_t>(num_primary_cache_pages) -
+                           static_cast<int64_t>(retired_pages_.size());
+    const int64_t free = static_cast<int64_t>(_empty_pages.size());
+    return {{"total_pages", num_primary_cache_pages}, {"active_pages", active},
+            {"free_pages", free}, {"used_pages", active - free},
+            {"retired_pages", static_cast<int64_t>(retired_pages_.size())}};
+}
+
+std::tuple<std::vector<int64_t>, std::vector<int64_t>,
+           std::unordered_map<int64_t, std::vector<int>>>
+GPUKVCacheManagerImpl::page_snapshot() const {
+    auto queue = _empty_pages;
+    std::vector<int64_t> free_pages;
+    free_pages.reserve(queue.size());
+    while (!queue.empty()) {
+        free_pages.push_back(queue.front());
+        queue.pop();
+    }
+    std::vector<int64_t> retired(retired_pages_.begin(), retired_pages_.end());
+    std::sort(retired.begin(), retired.end());
+    return {std::move(free_pages), std::move(retired), _uid_to_page_id};
+}
 
 bool GPUKVCacheManagerImpl::retain(int64_t uid)
 {
@@ -198,7 +275,7 @@ std::vector<int> &GPUKVCacheManagerImpl::alloc_single_sequence(
     const std::unordered_set<int64_t> &freezed_uids) {
     int cur_cached_start = 0;
     int cur_cached_len = 0;
-    const bool found_in_gpu_cache = retain(uid);
+    const bool found_in_gpu_cache = _lru_lookup_table.find(uid) != _lru_lookup_table.end();
     if (found_in_gpu_cache) {
         cur_cached_start = _uid_to_paged_cache_startpos.at(uid);
         cur_cached_len = _uid_to_paged_cache_length.at(uid);
@@ -209,6 +286,7 @@ std::vector<int> &GPUKVCacheManagerImpl::alloc_single_sequence(
     // vector and cache metadata unchanged.
     if (found_in_gpu_cache && cur_cached_start == 0 &&
         cur_cached_len == new_total_length) {
+        retain(uid);
         return _uid_to_page_id.at(uid);
     }
 
@@ -245,6 +323,10 @@ std::vector<int> &GPUKVCacheManagerImpl::alloc_single_sequence(
             }
             if (this->_uid_offload_lock.find((int64_t)*it) !=
                 _uid_offload_lock.end()) {
+                ++it;
+                continue;
+            }
+            if (_uid_inference_lock.find(*it) != _uid_inference_lock.end()) {
                 ++it;
                 continue;
             }
@@ -285,6 +367,7 @@ std::vector<int> &GPUKVCacheManagerImpl::alloc_single_sequence(
         page_ids[i] = _empty_pages.front();
         _empty_pages.pop();
     }
+    retain(uid);
     _uid_to_page_id[uid] = std::move(page_ids);
     _uid_to_paged_cache_startpos[uid] = 0;
     _uid_to_paged_cache_length[uid] = new_total_length;
@@ -313,6 +396,19 @@ void GPUKVCacheManagerImpl::allocate(
                                        this->num_tokens_per_page));
 
     const auto *total_hist_lens_ptr = total_hist_lens.data_ptr<int64_t>();
+    int64_t required_batch_pages = 0;
+    for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+        const int64_t length = total_hist_lens_ptr[seq_idx];
+        TORCH_CHECK(length >= 0 && length <= max_sequence_length,
+                    "KV history length is outside the configured sequence capacity");
+        required_batch_pages += (length + num_tokens_per_page - 1) / num_tokens_per_page;
+    }
+    const int64_t active_pages = static_cast<int64_t>(num_primary_cache_pages) -
+                                 static_cast<int64_t>(retired_pages_.size());
+    TORCH_CHECK(required_batch_pages <= active_pages,
+                "Insufficient active KV pages for batch: required=", required_batch_pages,
+                ", active=", active_pages, ", retired=", retired_pages_.size(),
+                ". Reduce the request working set or restore retired pages.");
     int *host_bufptr = static_cast<int *>(this->metadata_host_buffer);
 
     int *page_indptr = host_bufptr;
