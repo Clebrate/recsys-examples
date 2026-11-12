@@ -661,7 +661,8 @@ def run(args):
                 batch_size=len(rows), feature_to_max_seqlen=feature_max,
                 contextual_feature_names=contexts, item_feature_name="video_id",
                 action_feature_name="action_weights", max_num_candidates=manifest["num_candidates"],
-                num_candidates=torch.full((len(rows),), manifest["num_candidates"], dtype=torch.int64, device=device),
+                num_candidates=torch.tensor([len(row["candidates"]) for row in rows],
+                                            dtype=torch.int64, device=device),
             )
 
         cursor, batch_id, profile_count = 0, 0, 0
