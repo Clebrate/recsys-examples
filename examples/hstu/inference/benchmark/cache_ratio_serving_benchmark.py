@@ -496,6 +496,15 @@ def run(args):
         if sha256(trace_dir / filename) != expected:
             raise ValueError(f"Frozen input changed: {filename}")
     requests = [json.loads(line) for line in (trace_dir / "trace.jsonl").open()]
+    arrival_scale = 1.0
+    if getattr(args, "arrival_rps", None) is not None:
+        origin = requests[0]["arrival_s"]
+        span = requests[-1]["arrival_s"] - origin
+        if span <= 0 or len(requests) < 2:
+            raise ValueError("Arrival-rate scaling requires a nonzero trace duration")
+        arrival_scale = (len(requests) - 1) / args.arrival_rps / span
+        for request in requests:
+            request["arrival_s"] = (request["arrival_s"] - origin) * arrival_scale
     profile_request_ids = {int(value) for value in args.profile_request_ids.split(",") if value.strip()}
     if any(value < args.warmup_requests or value >= len(requests) for value in profile_request_ids):
         raise ValueError("profile-request-ids must refer to timed requests in the frozen trace")
@@ -624,6 +633,8 @@ def run(args):
             "cuda_version": torch.version.cuda, "gpu_name": torch.cuda.get_device_name(),
             "warmup_protocol": "Unpaced trace prefix; caches preserved into timed replay",
             "trace_timed_origin_s": requests[args.warmup_requests]["arrival_s"],
+            "replay_arrival_scale": arrival_scale,
+            "arrival_scaling_scope": "Uniformly scales frozen interarrival gaps; target rate is over the full trace before warmup removal",
             "serving_semantics": "Single worker, real HSTU forwards, real wall-clock arrivals; no network/Triton frontend",
             "batching": "FIFO; stop at repeated user/date or full token/batch limit; oldest-arrival deadline",
             "profile_samples": [], "observation_wall_ms": 0.0,
@@ -782,6 +793,9 @@ def run(args):
                 fetch_simulation = ({key: memory_pool.embedding.last_lookup_stats.get(key, 0)
                                      for key in ("simulated_mget_calls", "requested_wait_ms", "actual_wait_ms")}
                                     if memory_pool else {})
+                video_lookup = ({key: memory_pool.embedding.last_lookup_stats[key]
+                                 for key in ("queries", "gpu_hits", "ps_hits", "hit_count_source")}
+                                if memory_pool else {})
                 if args.validate_output and validate_next:
                     # Diagnostic runs only: rebuilding the full input is required
                     # because forward_with_kvcache strips cached features in place.
@@ -822,6 +836,7 @@ def run(args):
                     "forward_cuda_span_ms": gpu_start.elapsed_time(gpu_end),
                     "profiled": sampled, "cache_stats": cache_stats,
                     "fetch_simulation": fetch_simulation,
+                    "video_lookup_occurrences": video_lookup,
                 }
                 batch_file.write(json.dumps(batch_record) + "\n")
                 for index, row in enumerate(rows):
@@ -833,6 +848,7 @@ def run(args):
                         "user_id": row["user_id"], "date": row["date"], "cache_uid": row["cache_uid"],
                         "source_timestamp_ms": row["timestamp_ms"],
                         "history_len": row["history_len"], "arrival_s": arrival,
+                        "candidate_count": len(row["candidates"]),
                         "history_tokens": row["history_len"] * 2 + len(contexts),
                         "dispatch_s": dispatch, "ready_s": ready,
                         "queue_ms": (dispatch - arrival) * 1000, "latency_ms": (ready - arrival) * 1000,
@@ -931,6 +947,7 @@ def main():
     replay.add_argument("--max-batch-size", type=int, default=8)
     replay.add_argument("--max-batch-tokens", type=int, default=65536)
     replay.add_argument("--max-batch-delay-ms", type=float, default=1.0)
+    replay.add_argument("--arrival-rps", type=float, help="Scale frozen interarrival gaps to this full-trace mean offered rate without changing the saved trace")
     replay.add_argument("--warmup-requests", type=int, default=0)
     replay.add_argument("--profile-every", type=int, default=0, help="0 disables sampling; use a separate profiling run for clean timings")
     replay.add_argument("--profile-request-ids", default="", help="Comma-separated timed request IDs to profile, e.g. one representative per phase")
@@ -951,7 +968,7 @@ def main():
     if getattr(args, "arrival_rps", None) is not None:
         if not math.isfinite(args.arrival_rps) or args.arrival_rps <= 0:
             parser.error("arrival_rps must be finite and positive")
-        if args.workload == "aba":
+        if getattr(args, "workload", None) == "aba":
             parser.error("ABA arrival_rps is specified in --workload-config")
     if args.stage == "prepare":
         prepare(args)
