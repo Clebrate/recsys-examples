@@ -8,6 +8,7 @@
 #include <dlpack/dlpack.h>
 #include <cuda_runtime_api.h>
 #include <allocator.hpp>
+#include <buffer_wrapper.hpp>
 #include <default_allocator.hpp>
 #include <gpu_table.hpp>
 #include <hierarchical_embedding_layer.hpp>
@@ -103,14 +104,19 @@ struct Bank {
   std::shared_ptr<nve::GpuTable<int64_t>> gpu;
   std::shared_ptr<Layer> layer;
   std::unordered_map<uintptr_t, nve::context_ptr_t> contexts;
+  std::unordered_map<uintptr_t, nve::context_ptr_t> probe_contexts;
 
   Bank(py::object keep_alive, uintptr_t address, size_t size)
       : owner(std::move(keep_alive)), ptr(address), bytes(size) {}
 
-  void wait() { for (auto& entry : contexts) entry.second->wait(); }
+  void wait() {
+    for (auto& entry : contexts) entry.second->wait();
+    for (auto& entry : probe_contexts) entry.second->wait();
+  }
   void release_layer() {
     wait();
     contexts.clear();
+    probe_contexts.clear();
     layer.reset();
     gpu.reset();
     if (allocator && allocator->leased)
@@ -154,6 +160,55 @@ class BankedNVE {
   }
 
   ~BankedNVE() { try { close(); } catch (...) {} }
+
+  // Diagnostic only: GPU membership before a logical lookup populates any bank.
+  // Unlike Layer::lookup's final hitmask, this mask excludes CPU PS resolutions.
+  // A separate context keeps probe miss counters out of the measured lookup.
+  std::vector<bool> probe_bank(size_t bank_id, const py::capsule& keys_capsule,
+                              uintptr_t stream_ptr) {
+    ensure_open();
+    if (bank_id >= banks_.size()) throw std::out_of_range("Invalid bank ID");
+    ConsumedTensor keys(keys_capsule);
+    const auto& tensor = keys.tensor();
+    if (tensor.device.device_type != kDLCUDA || tensor.device.device_id != device_ ||
+        tensor.ndim != 1 || tensor.dtype.code != kDLInt || tensor.dtype.bits != 64 ||
+        tensor.dtype.lanes != 1 || (tensor.strides && tensor.strides[0] != 1))
+      throw std::invalid_argument("Probe keys must be a contiguous CUDA int64 vector");
+    const int64_t count = tensor.shape[0];
+    if (count < 0 || count > max_batch_keys_)
+      throw std::invalid_argument("Split probe batches at max_batch_keys");
+    std::vector<bool> hits(static_cast<size_t>(count), false);
+    auto& bank = *banks_[bank_id];
+    if (!count || !bank.gpu) return hits;
+    if (!keys.data() || reinterpret_cast<uintptr_t>(keys.data()) % 8)
+      throw std::invalid_argument("Invalid or unaligned probe keys");
+    check_cuda(cudaSetDevice(device_));
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto& context = bank.probe_contexts[stream_ptr];
+    if (!context) context = bank.gpu->create_execution_context(stream, stream, nullptr, nullptr);
+    const size_t mask_elements = (static_cast<size_t>(count) + 63) / 64;
+    const size_t mask_bytes = mask_elements * sizeof(nve::bitmask64_t);
+    auto* mask = static_cast<nve::bitmask64_t*>(context->get_buffer("probe_mask", mask_bytes, false));
+    const size_t value_bytes = static_cast<size_t>(count * width_ * 4);
+    auto* values = context->get_buffer("probe_values", value_bytes, false);
+    check_cuda(cudaMemsetAsync(mask, 0, mask_bytes, stream));
+    auto keys_bw = std::make_shared<nve::BufferWrapper<const void>>(
+        context, "probe_keys", keys.data(), static_cast<size_t>(count) * sizeof(int64_t));
+    auto mask_bw = std::make_shared<nve::BufferWrapper<nve::bitmask64_t>>(
+        context, "probe_mask", mask, mask_bytes);
+    // Supply scratch values: the SDK's GPU query kernel writes hit payloads even
+    // though Table::find documents nullptr as an exists-only optimization.
+    auto values_bw = std::make_shared<nve::BufferWrapper<void>>(
+        context, "probe_values", values, value_bytes);
+    bank.gpu->reset_lookup_counter(context);
+    bank.gpu->find(context, count, keys_bw, mask_bw, width_ * 4, values_bw, nullptr);
+    std::vector<nve::bitmask64_t> host_mask(mask_elements);
+    check_cuda(cudaMemcpyAsync(host_mask.data(), mask, mask_bytes, cudaMemcpyDeviceToHost, stream));
+    check_cuda(cudaStreamSynchronize(stream));
+    for (int64_t i = 0; i < count; ++i)
+      hits[static_cast<size_t>(i)] = (host_mask[static_cast<size_t>(i) / 64] >> (i % 64)) & 1;
+    return hits;
+  }
 
   py::dict lookup_bank(size_t bank_id, const py::capsule& keys_capsule,
                        const py::capsule& output_capsule, uintptr_t stream_ptr,
@@ -245,6 +300,22 @@ class BankedNVE {
     for (auto& bank : banks_) bank->wait();
   }
 
+  // State preparation only: empty GPU rows without rebuilding table/context
+  // scratch buffers, and never clear the shared CPU parameter server.
+  void clear_gpu_cache(uintptr_t stream_ptr) {
+    ensure_open();
+    check_cuda(cudaSetDevice(device_));
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    for (auto& bank : banks_) {
+      if (!bank->gpu) continue;
+      bank->wait();
+      auto& context = bank->probe_contexts[stream_ptr];
+      if (!context) context = bank->gpu->create_execution_context(stream, stream, nullptr, nullptr);
+      bank->gpu->clear(context);
+    }
+    check_cuda(cudaStreamSynchronize(stream));
+  }
+
   py::dict stats() const {
     py::dict result;
     result["bank_count"] = banks_.size();
@@ -268,6 +339,10 @@ class BankedNVE {
       entry["gpu_hits"] = bank.gpu_hits;
       entry["ps_hits"] = bank.ps_hits;
       entry["insert_batches"] = bank.insert_batches;
+      py::dict lookup_context_ptrs;
+      for (const auto& context : bank.contexts)
+        lookup_context_ptrs[py::int_(context.first)] = reinterpret_cast<uintptr_t>(context.second.get());
+      entry["lookup_context_ptrs"] = lookup_context_ptrs;
       entries.append(entry);
       span_bytes += bank.bytes;
       if (bank.gpu) active_bytes += bank.bytes;
@@ -346,6 +421,9 @@ void bind_banked_embedding(py::module_& module) {
            py::arg("device") = 0, py::arg("max_batch_keys") = 4096)
       .def("lookup_bank", &BankedNVE::lookup_bank, py::arg("bank_id"), py::arg("keys_dlpack"),
            py::arg("output_dlpack"), py::arg("stream_ptr"), py::arg("populate") = true)
+      .def("probe_bank", &BankedNVE::probe_bank, py::arg("bank_id"), py::arg("keys_dlpack"),
+           py::arg("stream_ptr"))
+      .def("clear_gpu_cache", &BankedNVE::clear_gpu_cache, py::arg("stream_ptr"))
       .def("retire", &BankedNVE::retire)
       .def("restore", &BankedNVE::restore)
       .def("wait", &BankedNVE::wait)

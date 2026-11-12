@@ -87,6 +87,7 @@ class BankedNVEEmbedding(torch.nn.Module):
         self._live_banks = [True] * self.bank_count
         self._route_ids = list(range(self.bank_count))
         self._collect_lookup_stats = False
+        self._collect_unique_stats = False
         self.profile = False
         self.mget_wait_ms = 0.0
         if device is None:
@@ -107,6 +108,39 @@ class BankedNVEEmbedding(torch.nn.Module):
         self.last_lookup_stats = {}
 
     @torch.no_grad()
+    def probe_unique(self, keys: torch.Tensor):
+        """Diagnostic GPU membership without PS fetches or cache population.
+
+        This reads payloads into scratch and warms hardware caches. Use a
+        separate diagnostic pass rather than subtracting its time from latency.
+        """
+        if keys.dtype != torch.int64 or keys.ndim != 1 or keys.device != self.device:
+            raise ValueError("Expected a CUDA int64 key vector on the bank device")
+        probe_started = time.perf_counter()
+        stream_ptr = torch.cuda.current_stream(self.device).cuda_stream
+        unique_keys, counts = torch.unique(keys, sorted=True, return_counts=True)
+        unique_routes = self._bank_routes[primary_bank_ids(unique_keys, self.bank_count)]
+        unique_hits = occurrence_hits = 0
+        for bank_id in range(self.bank_count):
+            positions = torch.nonzero(unique_routes == bank_id, as_tuple=False).flatten()
+            for start in range(0, positions.numel(), self.max_batch_keys):
+                selected = positions[start:start + self.max_batch_keys]
+                probe_keys = unique_keys.index_select(0, selected).contiguous()
+                hits = self._backend.probe_bank(bank_id, to_dlpack(probe_keys), stream_ptr)
+                weights = counts.index_select(0, selected).cpu().tolist()
+                unique_hits += sum(hits)
+                occurrence_hits += sum(weight for weight, hit in zip(weights, hits) if hit)
+        return {
+            "prelookup_unique_ids": unique_keys.numel(),
+            "prelookup_unique_gpu_hits": unique_hits,
+            "prelookup_unique_gpu_misses": unique_keys.numel() - unique_hits,
+            "prelookup_occurrence_gpu_hits": occurrence_hits,
+            "prelookup_occurrence_gpu_misses": keys.numel() - occurrence_hits,
+            "prelookup_probe_wall_ms": (time.perf_counter() - probe_started) * 1000,
+            "prelookup_scope": "GPU membership before any logical-lookup population; no PS lookup or insert; diagnostic timing only",
+        }
+
+    @torch.no_grad()
     def forward(self, keys: torch.Tensor, *, populate: bool = True) -> torch.Tensor:
         if not math.isfinite(self.mget_wait_ms) or self.mget_wait_ms < 0:
             raise ValueError("mget_wait_ms must be finite and nonnegative")
@@ -116,12 +150,14 @@ class BankedNVEEmbedding(torch.nn.Module):
         totals = {"queries": 0, "gpu_hits": 0, "ps_hits": 0}
         bank_results = []
         profile_range = torch.profiler.record_function if self.profile else nullcontext
+        stream_ptr = torch.cuda.current_stream(self.device).cuda_stream
+        # Probe every bank before any normal lookup can populate one of them.
+        unique_stats = self.probe_unique(keys) if self._collect_unique_stats else {}
         # Primary partitions never change. Only retired partitions can borrow
         # the first live bank; this is an explicit policy, not retained hits.
         with profile_range("recsys.embedding.banked.route_and_gather"):
             primary_routes = primary_bank_ids(keys, self.bank_count)
             routes = self._bank_routes[primary_routes]
-        stream_ptr = torch.cuda.current_stream(self.device).cuda_stream
         for bank_id in range(self.bank_count):
             with profile_range("recsys.embedding.banked.route_and_gather"):
                 positions = torch.nonzero(routes == bank_id, as_tuple=False).flatten()
@@ -153,6 +189,7 @@ class BankedNVEEmbedding(torch.nn.Module):
         totals["gpu_hit_rate"] = totals["gpu_hits"] / totals["queries"] if totals["queries"] else 0.0
         totals["banks"] = bank_results
         totals["hit_count_source"] = _HIT_COUNT_SOURCE
+        totals.update(unique_stats)
         self.last_lookup_stats = totals
         return result
 
@@ -192,6 +229,15 @@ class BankedNVEEmbedding(torch.nn.Module):
 
     def set_collect_lookup_stats(self, enabled: bool):
         self._collect_lookup_stats = bool(enabled)
+
+    def set_collect_unique_stats(self, enabled: bool):
+        """Enable an extra, non-populating membership probe for diagnostic runs."""
+        self._collect_unique_stats = bool(enabled)
+
+    def clear_gpu_cache(self):
+        """Empty live GPU banks at a setup boundary, preserving PS and contexts."""
+        self._backend.clear_gpu_cache(torch.cuda.current_stream(self.device).cuda_stream)
+        self.last_lookup_stats = {}
 
     def get_last_lookup_stats(self):
         if not self._collect_lookup_stats or not self.last_lookup_stats:
