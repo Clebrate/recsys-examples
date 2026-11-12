@@ -262,7 +262,7 @@ def run(args):
                     lengths=torch.tensor(lengths, dtype=torch.int64, device=device)),
                 batch_size=1, feature_to_max_seqlen=feature_max,
                 contextual_feature_names=contexts, item_feature_name="video_id",
-                action_feature_name="action_weights", max_num_candidates=manifest["num_candidates"],
+                action_feature_name="action_weights", max_num_candidates=len(row["candidates"]),
                 num_candidates=torch.tensor([len(row["candidates"])], dtype=torch.int64, device=device))
 
         def clear_embedding():

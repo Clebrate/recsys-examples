@@ -651,7 +651,13 @@ def run(args):
                     values.extend(feature)
                     feature_lengths.append(len(feature))
                 lengths.extend(feature_lengths)
-                feature_max[name] = max(feature_lengths)
+                # The inference preprocessor subtracts max_num_candidates to
+                # derive a history bound. Actual max(H + C) is too small when
+                # the longest history has fewer than the maximum candidates.
+                feature_max[name] = (
+                    max(feature_lengths) if name in contexts
+                    else max(row["history_len"] for row in rows) + manifest["num_candidates"]
+                )
             return HSTUBatch(
                 features=KeyedJaggedTensor.from_lengths_sync(
                     keys=[*contexts, "video_id", "action_weights"],
