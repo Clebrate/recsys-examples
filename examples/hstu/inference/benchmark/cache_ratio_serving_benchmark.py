@@ -767,8 +767,8 @@ def run(args):
                     model.profile_cache = False
                     if memory_pool:
                         memory_pool.embedding.profile = False
-                if batch_id == 0 and not torch.isfinite(logits).all().item():
-                    raise RuntimeError("First output contains nonfinite values")
+                if (batch_id == 0 or args.validate_output) and not torch.isfinite(logits).all().item():
+                    raise RuntimeError(f"Nonfinite output at request {rows[0]['request_id']}")
                 cache_stats = getattr(model, "last_cache_stats", None)
                 if cache_stats is None:
                     raise RuntimeError("This benchmark requires the collect_cache_stats model instrumentation")
@@ -800,6 +800,7 @@ def run(args):
                         "repeat_embedding_hit_rate": repeat_stats.get("embedding_hit_rate"),
                         "repeat_scope": "Conditional warm-batch service reference; excludes input construction and prefill, not an E2E or same-budget online result",
                     })
+                    (out / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n")
                     validate_next = False
                 workload_phases = list(dict.fromkeys(row.get("workload_phase", "natural") for row in rows))
                 batch_record = {

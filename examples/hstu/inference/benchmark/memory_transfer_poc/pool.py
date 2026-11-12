@@ -24,6 +24,11 @@ class CachePool:
         if initial_ratio not in self.ratios:
             raise ValueError(f"POC ratios are {self.ratios}")
         self.tensor = self.device_cache.gpu_kvcache_tensor
+        # Paged attention loads the last page's V padding before multiplying
+        # by zero attention weights. Uninitialized NaNs would still propagate.
+        with torch.inference_mode():
+            self.tensor.zero_()
+        torch.cuda.synchronize(self.tensor.device)
         layers, pages = self.tensor.shape[:2]
         if pages < 3:
             raise ValueError("Need at least three KV pages")
@@ -87,7 +92,9 @@ class CachePool:
         snapshot = self.device_cache.page_snapshot()["user_pages"]
         evicted = set()
         transferred = 0
+        initialized = 0
         evict_ms = bank_ms = page_ms = 0.0
+        initialize_ms = 0.0
         while self.level != target:
             growing = target > self.level
             group = self.level if growing else self.level - 1
@@ -96,6 +103,14 @@ class CachePool:
                 tick = time.perf_counter()
                 self.embedding.retire(banks)
                 bank_ms += (time.perf_counter() - tick) * 1000
+                tick = time.perf_counter()
+                # Finite FP32 embedding bytes can encode BF16 NaNs. Clear only
+                # the returned range, including padding, before KV can reuse it.
+                with torch.inference_mode():
+                    self.tensor[:, first:first + count].zero_()
+                torch.cuda.synchronize(self.tensor.device)
+                initialize_ms += (time.perf_counter() - tick) * 1000
+                initialized += count * self.page_bytes
                 tick = time.perf_counter()
                 self.device_cache.restore_pages(first, count)
                 page_ms += (time.perf_counter() - tick) * 1000
@@ -125,6 +140,7 @@ class CachePool:
             "transition_wall_ms": (time.perf_counter() - started) * 1000,
             "drain_ms": (drained - started) * 1000, "evict_ms": evict_ms,
             "bank_rebuild_ms": bank_ms, "page_ownership_ms": page_ms,
+            "kv_initialize_ms": initialize_ms, "initialized_payload_bytes": initialized,
             "transferred_backing_bytes": transferred, "copied_payload_bytes": 0,
             "evicted_users": len(evicted),
             "evicted_kv_bytes": sum(len(snapshot[uid]) for uid in evicted) * self.page_bytes,
