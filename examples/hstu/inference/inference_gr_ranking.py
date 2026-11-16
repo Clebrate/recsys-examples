@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import enum
+import json
 import math
 import sys
 import time
@@ -26,6 +27,7 @@ from commons.datasets.inference_dataset import InferenceDataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import (
+    EmbeddingBackend,
     InferenceEmbeddingConfig,
     PositionEncodingConfig,
     RankingConfig,
@@ -130,7 +132,29 @@ def get_inference_hstu_model(
     total_max_seqlen,
     checkpoint_dir,
     use_kvcache,
+    *,
+    embedding_backend=None,
+    cache_budget_bytes=None,
+    kv_cache_ratio=None,
 ):
+    kv_cache_bytes = embedding_cache_bytes = None
+    if cache_budget_bytes is not None or kv_cache_ratio is not None:
+        if cache_budget_bytes is None or kv_cache_ratio is None:
+            raise ValueError(
+                "cache_budget_bytes and kv_cache_ratio must be supplied together"
+            )
+        if not use_kvcache or embedding_backend != EmbeddingBackend.NVEMB:
+            raise ValueError("Shared cache budget requires KV caching and NVEmb")
+        if type(cache_budget_bytes) is not int or cache_budget_bytes <= 0:
+            raise ValueError("cache_budget_bytes must be a positive integer")
+        if not math.isfinite(kv_cache_ratio) or not 0 < kv_cache_ratio < 1:
+            raise ValueError(
+                "kv_cache_ratio must be finite and strictly between 0 and 1"
+            )
+        kv_cache_bytes = int(cache_budget_bytes * kv_cache_ratio)
+        embedding_cache_bytes = cache_budget_bytes - kv_cache_bytes
+        if min(kv_cache_bytes, embedding_cache_bytes) <= 0:
+            raise ValueError("Both cache budgets must be positive")
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
         inference_dtype = torch.bfloat16
@@ -162,9 +186,41 @@ def get_inference_hstu_model(
     )
 
     sm_major = torch.cuda.get_device_capability()[0]
-    kvcache_page_size = 128 if sm_major >= 10 else 32
+    kvcache_page_size = 128 if 10 <= sm_major < 12 else 32
     base_cache_tokens = 10240 * 32
     num_primary_cache_pages = math.ceil(base_cache_tokens / kvcache_page_size)
+    kv_payload_bytes = None
+    if kv_cache_bytes is not None:
+        if any(
+            type(n) is not int or n <= 0
+            for n in (
+                network_args.num_layers,
+                network_args.num_attention_heads,
+                network_args.kv_channels,
+            )
+        ):
+            raise ValueError("KV dimensions must be positive integers")
+        # One page contains K and V for every layer.
+        bytes_per_page = (
+            2
+            * network_args.num_layers
+            * network_args.num_attention_heads
+            * network_args.kv_channels
+            * kvcache_page_size
+            * torch.empty((), dtype=inference_dtype).element_size()
+        )
+        num_primary_cache_pages = kv_cache_bytes // bytes_per_page
+        kv_payload_bytes = num_primary_cache_pages * bytes_per_page
+        if num_primary_cache_pages == 0:
+            raise ValueError(
+                f"KV budget must hold at least one page ({bytes_per_page} bytes)"
+            )
+        min_pages = max_batch_size * math.ceil(total_max_seqlen / kvcache_page_size)
+        if num_primary_cache_pages < min_pages:
+            raise ValueError(
+                f"KV budget holds {num_primary_cache_pages} pages, but a maximum "
+                f"batch requires {min_pages}; increase the budget or reduce batch/sequence size"
+            )
     kvcache_max_seq_len = (
         math.ceil(total_max_seqlen / kvcache_page_size) * kvcache_page_size
     )
@@ -215,6 +271,8 @@ def get_inference_hstu_model(
         task_config=task_config,
         use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
+        embedding_backend=embedding_backend,
+        gpu_cache_bytes=embedding_cache_bytes,
     )
     if hstu_config.bf16:
         model.bfloat16()
@@ -222,6 +280,24 @@ def get_inference_hstu_model(
         model.half()
     model.load_checkpoint(checkpoint_dir)
     model.eval()
+
+    dynamic_embeddings = model.sparse_module._dynamic_embedding_collection
+    model.cache_budget_report = {
+        "cache_budget_bytes": cache_budget_bytes,
+        "kv_cache_ratio": kv_cache_ratio,
+        "kv_payload_bytes": (
+            model.dense_module.kvcache.gpu_kvcache_mgr.gpu_kvcache_tensor.nbytes
+            if use_kvcache
+            else 0
+        ),
+        "embedding_gpu_bytes_by_table": getattr(
+            dynamic_embeddings, "gpu_cache_bytes_by_table", None
+        ),
+        "scope": "Cache payload requests; model, static tables and allocator overhead excluded",
+    }
+    if kv_payload_bytes is not None:
+        assert model.cache_budget_report["kv_payload_bytes"] == kv_payload_bytes
+    print("Cache budget:", json.dumps(model.cache_budget_report, sort_keys=True))
 
     return model
 
@@ -232,6 +308,7 @@ def run_ranking_gr_simulate(
     disable_contextual_features: bool = False,
     disable_kvcache: bool = False,
     max_bs: int = 1,
+    cache_options=None,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -255,7 +332,8 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
-            True,
+            not disable_kvcache,
+            **(cache_options or {}),
         )
 
         if check_auc:
@@ -341,6 +419,7 @@ def run_ranking_gr_evaluate(
     checkpoint_dir: str,
     disable_contextual_features: bool = False,
     disable_kvcache: bool = False,
+    cache_options=None,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -380,6 +459,7 @@ def run_ranking_gr_evaluate(
             total_max_seqlen,
             checkpoint_dir,
             use_kvcache,
+            **(cache_options or {}),
         )
 
         eval_module = get_multi_event_metric_module(
@@ -453,8 +533,28 @@ if __name__ == "__main__":
     parser.add_argument("--disable_context", action="store_true")
     parser.add_argument("--disable_kvcache", action="store_true")
     parser.add_argument("--max_bs", type=int, default=1)
+    parser.add_argument(
+        "--embedding_backend", choices=[backend.value for backend in EmbeddingBackend]
+    )
+    parser.add_argument(
+        "--cache_budget_bytes",
+        type=int,
+        help="Combined KV and dynamic embedding cache payload budget",
+    )
+    parser.add_argument(
+        "--kv_cache_ratio",
+        type=float,
+        help="KV share of cache_budget_bytes, strictly between 0 and 1",
+    )
 
     args = parser.parse_args()
+    cache_options = {
+        "embedding_backend": (
+            EmbeddingBackend(args.embedding_backend) if args.embedding_backend else None
+        ),
+        "cache_budget_bytes": args.cache_budget_bytes,
+        "kv_cache_ratio": args.kv_cache_ratio,
+    }
     gin.parse_config_file(args.gin_config_file)
 
     if args.mode == RunningMode.EVAL:
@@ -463,16 +563,17 @@ if __name__ == "__main__":
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
         run_ranking_gr_evaluate(
-            checkpoint_dir=args.checkpoint_dir, disable_kvcache=args.disable_kvcache
+            checkpoint_dir=args.checkpoint_dir,
+            disable_kvcache=args.disable_kvcache,
+            cache_options=cache_options,
         )
     elif args.mode == RunningMode.SIMULATE:
-        if args.disable_kvcache:
-            print("disable_kvcache is ignored in Eval mode.")
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,
             disable_contextual_features=args.disable_context,
             disable_kvcache=args.disable_kvcache,
             max_bs=args.max_bs,
+            cache_options=cache_options,
         )
     print("Finished.")
