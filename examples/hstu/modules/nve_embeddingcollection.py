@@ -107,9 +107,45 @@ try:
                 else {}
             )
 
+            # The opt-in native VMM storage reserves separately from its active
+            # value payload. Initial native cache_size includes the original
+            # per-set tag/counter/age layout; physical VMM metadata is reported
+            # by the binding and is not silently charged as usable values.
+            vmm_max_payload = int(os.environ.get("NVE_NVEMB_VMM_MAX_PAYLOAD_BYTES", "0"))
+            native_gpu_sizes = list(gpu_sizes)
+            if vmm_max_payload and not use_gpu_only:
+                if gpu_cache_bytes is None:
+                    raise ValueError("NVEmb VMM requires an explicit value payload budget")
+                chunk = int(os.environ.get("NVE_NVEMB_VMM_CHUNK_BYTES", str(2 * 1024**2)))
+                if chunk <= 0 or vmm_max_payload % chunk or any(chunk % (8 * row) for row in row_bytes):
+                    raise ValueError("NVEmb VMM chunks must align to native sets and the reservation")
+                available_chunks = gpu_cache_bytes // chunk
+                if available_chunks < len(configs):
+                    raise ValueError("NVEmb VMM budget must hold at least one chunk per table")
+                remaining_chunks = available_chunks - len(configs)
+                weight_sum = sum(table_bytes)
+                table_chunks = [1 + remaining_chunks * weight // weight_sum for weight in table_bytes]
+                remainder_order = sorted(
+                    range(len(configs)),
+                    key=lambda i: (-(remaining_chunks * table_bytes[i] % weight_sum), i),
+                )
+                for i in remainder_order[:available_chunks - sum(table_chunks)]:
+                    table_chunks[i] += 1
+                gpu_sizes = [count * chunk for count in table_chunks]
+                if any(size > vmm_max_payload for size in gpu_sizes):
+                    raise ValueError("NVEmb VMM initial payload exceeds its reservation")
+                native_gpu_sizes = [
+                    (payload // (8 * row)) * (8 * row + 104)
+                    for payload, row in zip(gpu_sizes, row_bytes)
+                ]
+                self.gpu_cache_bytes_by_table = dict(zip((c.name for c in configs), gpu_sizes))
+            self.gpu_cache_configured_bytes_by_table = (
+                dict(zip((c.name for c in configs), native_gpu_sizes)) if not use_gpu_only else {}
+            )
+
             for table_idx, embedding_config in enumerate(configs):
                 if not use_gpu_only:
-                    gpu_cache_size = gpu_sizes[table_idx]
+                    gpu_cache_size = native_gpu_sizes[table_idx]
                     storage = (
                         sparse_shareables[embedding_config.name]
                         if sparse_shareables

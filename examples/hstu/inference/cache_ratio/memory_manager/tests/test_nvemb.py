@@ -112,6 +112,40 @@ class NvEmbTests(unittest.TestCase):
         self.assertEqual(state["payload_bytes"], 2048)
         self.assertEqual(state["device_pool_bytes"], 2304)
 
+    def enable_vmm(self, row_bytes=(16, 16)):
+        for binding, width in zip(self.manager._bindings.values(), row_bytes):
+            original = binding.cache_resize_state
+
+            def state(original=original, width=width):
+                result = json.loads(original())
+                result.update(vmm=True, chunk_bytes=256, reserved_value_bytes=4096,
+                              row_bytes=width)
+                return json.dumps(result)
+
+            binding.cache_resize_state = state
+
+    def test_vmm_whole_chunks_largest_remainder_and_tie_order(self):
+        self.enable_vmm()
+        plan = self.manager.plan_resize(9 * 256 + 17)
+        self.assertEqual(plan["tables"]["user"]["payload_bytes"], 5 * 256)
+        self.assertEqual(plan["tables"]["video"]["payload_bytes"], 4 * 256)
+        self.assertEqual(plan["payload_bytes"], 9 * 256)
+        self.assertEqual(plan["requested_payload_bytes"] - plan["payload_bytes"], 17)
+
+    def test_vmm_weights_are_vocabulary_bytes_including_dtype_width(self):
+        self.enable_vmm((16, 32))
+        plan = self.manager.plan_resize(9 * 256)
+        self.assertEqual(plan["tables"]["user"]["payload_bytes"], 3 * 256)
+        self.assertEqual(plan["tables"]["video"]["payload_bytes"], 6 * 256)
+
+    def test_vmm_bounds_and_native_observation_missing_remain_explicit(self):
+        self.enable_vmm()
+        self.assertEqual(self.manager.payload_bounds(), dict(minimum_payload_bytes=512,
+                                                             maximum_payload_bytes=8192))
+        for result in self.manager.policy_observation()["tables"].values():
+            self.assertFalse(result["complete"])
+            self.assertEqual(result["reason"], "missing_native_observation")
+
     def test_plan_does_not_mutate_native_objects_or_capacity(self):
         before = self.manager.stats()
         plan = self.manager.plan_resize(3073)

@@ -16,10 +16,12 @@ template<class Raw> struct PreservingRehash {
   size_t survivor_rows = 0;
   size_t evicted_rows = 0;
   size_t host_peak_bound = 0;
+  std::vector<int64_t> evicted_keys;
 };
 
 template<class Raw>
-PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t host_limit) {
+PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t host_limit,
+                                           bool collect_evictions = false) {
   const auto require = [](bool ok, const char* reason) {
     if (!ok) throw std::invalid_argument(reason);
   };
@@ -63,6 +65,7 @@ PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t
   for (int i = 0; i < 2; ++i)
     for (size_t bytes : {sizeof(Raw), target_values, target_tags, target_counters, target_ages}) charge(bytes);
   charge(product(old_slots, sizeof(Entry))); charge(3072);
+  if (collect_evictions) charge(product(old_slots, sizeof(int64_t)));
   std::vector<Entry> entries;
   entries.reserve(old_slots);
   for (size_t slot = 0; slot < old_slots; ++slot) {
@@ -91,6 +94,7 @@ PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t
     i = end;
   }
   PreservingRehash<Raw> plan;
+  if (collect_evictions) plan.evicted_keys.reserve(old_slots);
   auto& target = plan.target;
   target.row_bytes = row; target.num_sets = sets; target.ways = ways;
   target.sentinel = old.sentinel; target.decay_rate = old.decay_rate; target.global_ts = old.global_ts;
@@ -106,12 +110,16 @@ PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t
       std::copy_n(old.data.data() + e.slot * row, row, target.data.data() + slot * row);
       ++plan.survivor_rows;
     }
+    if (collect_evictions)
+      for (size_t j = std::min(end, i + ways); j < end; ++j)
+        plan.evicted_keys.push_back(static_cast<int64_t>(entries[j].key));
     i = end;
   }
   plan.evicted_rows = entries.size() - plan.survivor_rows;
   remaining = host_limit;
   charge(raw_capacity(old)); charge(raw_capacity(target)); charge(raw_capacity(target));
   charge(product(entries.capacity(), sizeof(Entry))); charge(3072);
+  charge(product(plan.evicted_keys.capacity(), sizeof(int64_t)));
   plan.host_peak_bound = host_limit - remaining;
   return plan;
 }

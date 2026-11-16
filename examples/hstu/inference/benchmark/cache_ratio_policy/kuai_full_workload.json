@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "workload_id": "kuairand27k-full-742031-chronological-v1",
+  "scope": "Complete frozen Kuai-derived request source; original history>4096 exclusions remain; not unfiltered raw traffic. Model and SDK identities are recorded separately by the current runner.",
+  "source": {
+    "manifest_sha256": "dda2b34cf850af66fadd48b678b6f234fbea4e5aef51eebb329202f967d442e1",
+    "artifacts_sha256": {
+      "trace.jsonl": "c15b6bc10c5d97ffee76fe07f917c44c0b7c2c5ff2d4ed2729fdeadb2a2c2f41",
+      "sequences.jsonl": "4b8647e78313604838d39250994db4dd59ed2bf572bf7e249b82d6601fd99c0f",
+      "statistics.json": "90b252f06e8699966c7aee04bec53a21b4fc828fefaa4902ca6b28fc9632aa6a",
+      "windows.csv": "54df7e4157780c02deeb018a881c454c83e0fdb539e2678f23c33329986b8cc1",
+      "video_keys.npy": "543fc9df9d63b8d62f4373ba951fb2e0848cf9afa4527d7f103a21dbd8899e56"
+    },
+    "request_source": "training_sequences_chronological_prefixes",
+    "candidate_source": "subsequent_logged_exposure_ids_not_online_candidate_sets",
+    "filters": {
+      "source_users": 26904,
+      "source_interactions": 136296576,
+      "users_without_request": 329,
+      "users_with_history_cap_omissions": 11622,
+      "potential_requests": 1311217,
+      "omitted_requests_history_cap": 569186,
+      "kept_requests": 742031,
+      "partial_candidate_requests": 14436,
+      "history_boundary_tie_advances": 3780907,
+      "candidate_positions_skipped_at_ties": 3709174
+    }
+  },
+  "requests": {
+    "count": 742031,
+    "source_ids_half_open": [
+      0,
+      742031
+    ],
+    "users": 26575,
+    "reorder": false,
+    "cohort_filter": false
+  },
+  "arrivals": {
+    "effective_arrivals_sha256": "5ccefa25d90cdd4a7e10e731217b922ca532570ba30e73c016e7191f7d335d4b",
+    "selection": {
+      "kind": "original_order",
+      "workload_mode": "natural",
+      "cohort_user_limit": 0,
+      "max_requests": 0,
+      "selected_users": 26575,
+      "selected_requests": 742031,
+      "source_requests": 742031,
+      "arrival_rps": 200.0,
+      "arrival_scale": 0.0030611885565087742,
+      "selection_hash": "f6e0affbb44a70a5411d79c4dc2951ffb1c45eebdd40c6a3e5b91c8658237efd",
+      "scope": "Derived request/arrival stream; original request IDs retained"
+    },
+    "last_arrival_s": 3710.15,
+    "relative_intervals_preserved": true,
+    "rescale_per_window": false
+  },
+  "batching": {
+    "max_batch_size": 32,
+    "max_batch_tokens": 32768,
+    "max_batch_delay_ms": 1.0
+  },
+  "experiment_conditions": {
+    "cache_budget_bytes": 17179869184
+  }
+}

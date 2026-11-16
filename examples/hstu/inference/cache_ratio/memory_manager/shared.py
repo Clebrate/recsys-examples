@@ -263,9 +263,16 @@ class SharedCacheMemory:
                 return {"decision": asdict(decision), "action": None}
             try:
                 result = self.resize_ratio(decision.target_ratio, at_batch_barrier=True)
-            except Exception:
-                if self._state == "open":
+            except Exception as error:
+                after = self.stats()
+                # A rejection is safe only after verifying the native ledger,
+                # including per-table generations, did not change at all.
+                if after["state"] == "open" and after == actual:
                     policy.rejected(replay_clock(), "native_preflight_declined")
+                    return {"decision": asdict(decision), "action": None,
+                            "rejection": {"reason": "native_preflight_declined",
+                                          "error": str(error), "unchanged": True}}
+                self._state = "poisoned"
                 raise
             after = result["after"]
             receipt = ResizeReceipt(
@@ -284,6 +291,22 @@ class SharedCacheMemory:
                 self._state = "poisoned"
                 raise
             return {"decision": asdict(decision), "action": result}
+
+    def policy_ratio_bounds(self):
+        """Positive KV-batch and NVEmb-chunk bounds from actual reservations."""
+        with self._lock:
+            self._require_open()
+            minimum = self.kv.plan_pages(self.kv.minimum_pages)
+            maximum = self.kv.plan_pages(minimum["max_requested_pages"])
+            emb = self.embedding.payload_bounds()
+            budget = self.payload_budget_bytes
+            low = max(minimum["capacity_payload_bytes"], budget - emb["maximum_payload_bytes"])
+            high = min(maximum["capacity_payload_bytes"], budget - emb["minimum_payload_bytes"])
+            if not 0 < low < high < budget:
+                raise ValueError("No positive feasible policy ratio interval")
+            return {"min_ratio": low / budget, "max_ratio": high / budget,
+                    "minimum_kv_bytes": minimum["capacity_payload_bytes"],
+                    "maximum_kv_bytes": maximum["capacity_payload_bytes"], **emb}
 
     def close(self):
         with self._lock:

@@ -34,6 +34,7 @@ class NvEmbMemoryManager:
             for name, embedding in collection.embeddings.items()
         }
         configs = {config.name: config for config in collection.embedding_configs()}
+        self._vocab_sizes = {name: configs[name].num_embeddings for name in self._bindings}
         self._weights = {
             name: configs[name].num_embeddings * configs[name].embedding_dim
             for name in self._bindings
@@ -98,6 +99,34 @@ class NvEmbMemoryManager:
         ] = "cache_pools_excludes_model_execution_workspaces_and_handler_buffers"
         return result
 
+    def policy_observation(self, *, reset=True):
+        """Drain native observations; unavailable or overflowed data stays incomplete.
+
+        Native calls drain their contexts. Their synchronization and JSON/key
+        transfer are paid by the replay owner on its unchanged arrival clock.
+        """
+        tables = {}
+        for name, binding in self._bindings.items():
+            method = getattr(binding, "cache_policy_observation", None)
+            tables[name] = (
+                self._decode(method(reset))
+                if callable(method)
+                else {"enabled": False, "complete": False, "reason": "missing_native_observation"}
+            )
+        return {"tables": tables}
+
+    def payload_bounds(self):
+        """Reservation bounds, not a promise that every interior plan succeeds."""
+        states = self.stats()["tables"]
+        minimum = maximum = 0
+        for state in states.values():
+            unit = state["ways"] * state["row_bytes"]
+            if not state.get("vmm") or not state.get("reserved_value_bytes"):
+                raise ValueError("Policy bounds require explicit NVEmb VMM reservations")
+            minimum += max(unit, state["chunk_bytes"])
+            maximum += state["reserved_value_bytes"]
+        return {"minimum_payload_bytes": minimum, "maximum_payload_bytes": maximum}
+
     def plan_resize(self, payload_budget_bytes):
         """Read-only native snapshot/rehash plan; caller excludes forward calls.
 
@@ -119,11 +148,34 @@ class NvEmbMemoryManager:
         if remaining < 0:
             raise ValueError("Embedding payload must hold one native set per table")
         total_weight = sum(self._weights.values())
+        targets = {}
+        vmm = [state.get("vmm", False) for state in before["tables"].values()]
+        if any(vmm):
+            chunks = {state.get("chunk_bytes") for state in before["tables"].values()}
+            if not all(vmm) or len(chunks) != 1:
+                raise ValueError("Shared VMM planning requires one common chunk size")
+            chunk = chunks.pop()
+            if type(chunk) is not int or chunk <= 0 or any(chunk % q for q in quantum.values()):
+                raise ValueError("VMM chunk must contain whole native sets")
+            count = payload_budget_bytes // chunk
+            if count < len(quantum):
+                raise ValueError("Embedding payload must hold one VMM chunk per table")
+            remaining_chunks = count - len(quantum)
+            weights = {name: self._vocab_sizes[name] * before["tables"][name]["row_bytes"]
+                       for name in self._bindings}
+            vmm_weight = sum(weights.values())
+            shares = {name: divmod(remaining_chunks * weights[name], vmm_weight)
+                      for name in self._bindings}
+            spare = remaining_chunks - sum(value[0] for value in shares.values())
+            # Stable sorting gives configuration/binding order for exact ties.
+            winners = set(sorted(shares, key=lambda name: -shares[name][1])[:spare])
+            targets = {name: (1 + shares[name][0] + (name in winners)) * chunk
+                       for name in self._bindings}
         plans = {}
         started = time.perf_counter()
         for name, binding in self._bindings.items():
             unit = quantum[name]
-            target = (
+            target = targets.get(name) or (
                 unit + remaining * self._weights[name] // (total_weight * unit) * unit
             )
             native = self._decode(

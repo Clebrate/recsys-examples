@@ -1,25 +1,168 @@
+diff --git a/include/ecache/ec_online_helpers.cuh b/include/ecache/ec_online_helpers.cuh
+new file mode 100644
+--- /dev/null
++++ b/include/ecache/ec_online_helpers.cuh
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "ec_policy_observation.hpp"
++#include <cuda_runtime.h>
++
++namespace nve {
++template<typename Counter, unsigned Ways>
++__global__ void age_represented_rows(const uint32_t* represented, uint32_t count,
++    Counter* counters, int64_t* row_ages, int64_t* set_ages, int64_t clock, float decay) {
++  const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  if (i >= uint64_t(count) * Ways) return;
++  const uint64_t set = represented[i / Ways], slot = set * Ways + i % Ways;
++  const int64_t delta = clock - row_ages[slot];
++  if (delta > 0 && decay != 1.0f) counters[slot] *= __powf(decay, static_cast<float>(delta));
++  row_ages[slot] = clock;
++  if (i % Ways == 0) set_ages[set] = clock;
++}
++
++template<int = 0>
++__global__ void effective_row_scores(const float* counters, const int64_t* row_ages,
++    uint64_t first, uint64_t count, int64_t clock, float decay, float* scores) {
++  const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  if (i >= count) return;
++  const int64_t delta = clock - row_ages[first + i];
++  float score = counters[first + i];
++  if (delta > 0 && decay != 1.0f) score *= __powf(decay, static_cast<float>(delta));
++  scores[i] = score;
++}
++
++template<typename Tag>
++__global__ void policy_count_resident(const Tag* tags, uint64_t slots, Tag sentinel,
++                                             PolicyEventHeader* header) {
++  // The caller launches 256 threads. Reduce the eight complete warps first;
++  // even lanes past the final slot participate with zero, including in the
++  // final partial block. Only one atomic per block reaches the shared counter.
++  __shared__ unsigned warp_sums[8];
++  const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  unsigned count = i < slots && tags[i] != sentinel ? 1 : 0;
++  for (unsigned offset = 16; offset; offset >>= 1)
++    count += __shfl_down_sync(0xffffffffU, count, offset);
++  if (threadIdx.x % 32 == 0) warp_sums[threadIdx.x / 32] = count;
++  __syncthreads();
++  if (threadIdx.x < 32) {
++    count = threadIdx.x < 8 ? warp_sums[threadIdx.x] : 0;
++    for (unsigned offset = 16; offset; offset >>= 1)
++      count += __shfl_down_sync(0xffffffffU, count, offset);
++    if (threadIdx.x == 0 && count) atomicAdd(&header->resident, static_cast<unsigned long long>(count));
++  }
++}
++
++template<typename List, typename Entry, typename Tag, unsigned Ways>
++__global__ void policy_record_replacements(const List* list, const Entry* entries,
++    uint32_t max_entries, const Tag* old_tags, uint64_t sets, Tag sentinel,
++    PolicyEventHeader* header, PolicyEvictionEvent* events, uint64_t capacity, int64_t clock) {
++  const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  if (i >= list->num_entries || i >= max_entries) return;
++  const Entry entry = entries[i];
++  const Tag old = old_tags[uint64_t(entry.set) * Ways + entry.way];
++  if (old == sentinel || old == entry.tag) return;
++  const unsigned long long position = atomicAdd(&header->total, 1ULL);
++  atomicAdd(&header->admission, 1ULL);
++  if (position < capacity) events[position] = {int64_t(uint64_t(old) * sets + entry.set), clock, 0};
++}
++}  // namespace nve
+diff --git a/include/ecache/ec_policy_observation.hpp b/include/ecache/ec_policy_observation.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/ecache/ec_policy_observation.hpp
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <allocator.hpp>
++#include <cuda_runtime_api.h>
++#include <algorithm>
++#include <cstdint>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++namespace nve {
++struct PolicyEventHeader {
++  unsigned long long total = 0, admission = 0, capacity = 0, resident = 0;
++};
++struct PolicyEvictionEvent { int64_t key, clock; uint64_t kind; };
++struct PolicyObservation {
++  PolicyEventHeader header;
++  std::vector<PolicyEvictionEvent> events;
++  uint64_t serial = 0;
++};
++
++// Shared by native cache views, including the legacy CPU migration path.
++// The bounded append log records dropped events through total > capacity.
++class NvEmbPolicyObservation {
++ public:
++  NvEmbPolicyObservation(std::shared_ptr<Allocator> allocator, size_t capacity)
++      : allocator_(std::move(allocator)), capacity_(capacity) {
++    if (!capacity || capacity > (1ULL << 26)) throw std::invalid_argument("Invalid policy event capacity");
++    bytes_ = sizeof(PolicyEventHeader) + capacity * sizeof(PolicyEvictionEvent);
++    checked(allocator_->device_allocate(&buffer_, bytes_));
++    try { checked(cudaMemset(buffer_, 0, sizeof(PolicyEventHeader))); }
++    catch (...) { allocator_->device_free(buffer_); buffer_ = nullptr; throw; }
++  }
++  ~NvEmbPolicyObservation() { if (buffer_) allocator_->device_free(buffer_); }
++  PolicyEventHeader* header() const { return static_cast<PolicyEventHeader*>(buffer_); }
++  PolicyEvictionEvent* events() const { return reinterpret_cast<PolicyEvictionEvent*>(header() + 1); }
++  size_t capacity() const { return capacity_; }
++  size_t bytes() const { return bytes_; }
++  PolicyObservation read(bool reset) {
++    PolicyObservation result;
++    checked(cudaMemcpy(&result.header, header(), sizeof(result.header), cudaMemcpyDeviceToHost));
++    result.events.resize(std::min<uint64_t>(result.header.total, capacity_));
++    if (!result.events.empty()) checked(cudaMemcpy(result.events.data(), events(),
++        result.events.size() * sizeof(PolicyEvictionEvent), cudaMemcpyDeviceToHost));
++    result.serial = serial_;
++    if (reset) { checked(cudaMemset(header(), 0, sizeof(PolicyEventHeader))); ++serial_; }
++    return result;
++  }
++  void append_capacity(const std::vector<int64_t>& keys, int64_t clock) {
++    if (keys.empty()) return;
++    PolicyEventHeader h;
++    checked(cudaMemcpy(&h, header(), sizeof(h), cudaMemcpyDeviceToHost));
++    const size_t count = h.total < capacity_ ? std::min<uint64_t>(keys.size(), capacity_ - h.total) : 0;
++    std::vector<PolicyEvictionEvent> copied(count);
++    for (size_t i = 0; i < count; ++i) copied[i] = {keys[i], clock, 1};
++    if (count) checked(cudaMemcpy(events() + h.total, copied.data(), count * sizeof(PolicyEvictionEvent), cudaMemcpyHostToDevice));
++    h.total += keys.size(); h.capacity += keys.size();
++    checked(cudaMemcpy(header(), &h, sizeof(h), cudaMemcpyHostToDevice));
++  }
++ private:
++  static void checked(cudaError_t status) { if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status)); }
++  std::shared_ptr<Allocator> allocator_;
++  void* buffer_ = nullptr;
++  size_t capacity_, bytes_;
++  uint64_t serial_ = 0;
++};
++}  // namespace nve
 diff --git a/include/ecache/ec_set_associative.h b/include/ecache/ec_set_associative.h
 --- a/include/ecache/ec_set_associative.h
 +++ b/include/ecache/ec_set_associative.h
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,8 @@
  
  #pragma once
  #include "embed_cache.h"
 +#include "ec_vmm_storage.hpp"
++#include "ec_policy_observation.hpp"
  #include <cstdio>
  #include <cstdarg>
  #include <cstdint>
-@@ -122,6 +123,9 @@
+@@ -122,6 +124,10 @@
          // Tag value used to mark a free slot. Inserting a key whose tag equals
          // sentinel_key is undefined behavior.
          TagT sentinel_key = static_cast<TagT>(-1);
 +        // Optional storage ownership only. Original hash and kernels are unchanged.
 +        std::shared_ptr<NvEmbVmmStorage> vmm_storage;
++        std::shared_ptr<NvEmbPolicyObservation> policy_observation;
 +        uint64_t vmm_active_sets = 0;
      };
  
      struct ModifyEntry
-@@ -154,6 +158,12 @@
+@@ -154,6 +160,12 @@
          if (num_sets == 0)
          {
              return ECERROR_MEMORY_ALLOCATED_TO_CACHE_TOO_SMALL;
@@ -32,7 +175,7 @@ diff --git a/include/ecache/ec_set_associative.h b/include/ecache/ec_set_associa
          }
          const size_t sz_tags_per_set = get_tag_size_per_set();
          const size_t sz_entry_per_set = get_entry_size_per_set();
-@@ -320,8 +330,10 @@
+@@ -320,8 +332,10 @@
  
      virtual ~EmbedCacheSA() override
      {
@@ -45,7 +188,7 @@ diff --git a/include/ecache/ec_set_associative.h b/include/ecache/ec_set_associa
      }
  
      virtual ECError init() override
-@@ -336,6 +348,28 @@
+@@ -336,6 +350,28 @@
              if (!this->logger_)
              {
                  EC_THROW(ECERROR_BAD_LOGGER);
@@ -74,7 +217,7 @@ diff --git a/include/ecache/ec_set_associative.h b/include/ecache/ec_set_associa
              }
  
              CacheAllocationSize alloc_sz = {0, 0}; 
-@@ -663,6 +697,8 @@
+@@ -663,6 +699,8 @@
          this->logger_->log(verbosity, buf);
      }
  
@@ -83,7 +226,7 @@ diff --git a/include/ecache/ec_set_associative.h b/include/ecache/ec_set_associa
      // Helper method to calculate tag size per set
      size_t get_tag_size_per_set() const {
          return CACHE_ALIGN(sizeof(TagT) * NUM_WAYS, 16);
-@@ -678,7 +714,10 @@
+@@ -678,7 +716,10 @@
          return 0;
      }
  
@@ -97,7 +240,7 @@ diff --git a/include/ecache/ec_set_associative.h b/include/ecache/ec_set_associa
 diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecache/ec_set_associative_device_modify.cuh
 --- a/include/ecache/ec_set_associative_device_modify.cuh
 +++ b/include/ecache/ec_set_associative_device_modify.cuh
-@@ -28,6 +28,12 @@
+@@ -28,6 +28,13 @@
  #include <vector>
  #include <unordered_map>
  #include <map>
@@ -107,10 +250,11 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +#include <stdexcept>
 +#include <type_traits>
 +#include "ec_vmm_rehash.cuh"
++#include "ec_online_helpers.cuh"
  
  namespace nve {
  
-@@ -41,7 +47,25 @@
+@@ -41,7 +48,28 @@
      using ModifyEntry = typename EmbedCacheSA<IndexT, TagT>::ModifyEntry;
      using ModifyList = typename EmbedCacheSA<IndexT, TagT>::ModifyList;
      using ModifyOpType = typename EmbedCacheSA<IndexT, TagT>::ModifyOpType;
@@ -132,16 +276,123 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +        std::vector<int8_t> data;
 +        std::vector<CounterT> counters;
 +        std::vector<int64_t> set_timestamps;
++        bool per_row_ages = false;
++        std::vector<int64_t> row_timestamps;
++        std::vector<float> effective_scores;
 +    };
  
      struct ModifyContext
      {
-@@ -64,11 +88,240 @@
+@@ -64,11 +92,348 @@
  
      virtual ~CacheSADeviceModify() override = default;
  
 +    uint64_t raw_num_sets_for_config() const { return this->calc_num_sets(); }
 +    float raw_decay_rate() const { return this->config_.decay_rate; }
++    int64_t raw_global_ts() const { return global_ts_; }
++
++    PolicyObservation policy_observation(bool reset) {
++        std::lock_guard<std::mutex> lock(modify_mutex_);
++        typename EmbedCacheSA<IndexT, TagT>::WriteLock flow_lock(this->custom_flow_mutex_, std::try_to_lock);
++        if (!flow_lock.owns_lock()) throw std::invalid_argument("Active flow prevents policy observation");
++        check_raw_scope();
++        auto owner = this->config_.policy_observation;
++        if (!owner) throw std::invalid_argument("Policy observation is disabled");
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaDeviceSynchronize());
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(&owner->header()->resident, 0, sizeof(unsigned long long)));
++        const uint64_t slots = this->num_sets_ * NUM_WAYS;
++        // Validated uint32 set count, eight ways: at most 2^27 blocks.
++        policy_count_resident<<<static_cast<unsigned>((slots + 255) / 256), 256>>>(this->d_tags_, slots,
++            this->config_.sentinel_key, owner->header());
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaGetLastError());
++        return owner->read(reset);
++    }
++
++    RawState export_general_state(bool caller_quiesced, size_t host_limit) {
++        if (!d_row_timestamps_ || !this->config_.vmm_storage)
++            throw std::invalid_argument("General resize requires per-row VMM ages");
++        auto state = export_raw_state(caller_quiesced, host_limit);
++        std::lock_guard<std::mutex> lock(modify_mutex_);
++        check_raw_scope();
++        state.effective_scores.resize(state.tags.size());
++        check_raw_host_capacity(state, host_limit);
++        auto* scores = static_cast<float*>(this->config_.vmm_storage->rehash_scratch());
++        const size_t chunk = this->config_.vmm_storage->scratch_bytes() / sizeof(float);
++        for (size_t first = 0; first < state.tags.size(); first += chunk) {
++            const size_t count = std::min(chunk, state.tags.size() - first);
++            // Fixed general scratch holds at most 65536 scores (256 blocks).
++            effective_row_scores<><<<static_cast<unsigned>((count + 255) / 256), 256>>>(d_counters_, d_row_timestamps_,
++                first, count, global_ts_, this->config_.decay_rate, scores);
++            CACHE_CUDA_ERR_CHK_AND_THROW(cudaGetLastError());
++            CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(state.effective_scores.data() + first, scores,
++                count * sizeof(float), cudaMemcpyDeviceToHost));
++        }
++        return state;
++    }
++
++    // Rewrite the existing native cache view under an exclusive barrier.
++    // No clear/init, policy reset, clock advance or second GPU value pool.
++    void apply_general_state(const RawState& state, bool caller_quiesced, size_t host_limit) {
++        if (!caller_quiesced) throw std::invalid_argument("General resize requires exclusive barrier");
++        std::lock_guard<std::mutex> lock(modify_mutex_);
++        typename EmbedCacheSA<IndexT, TagT>::WriteLock flow_lock(this->custom_flow_mutex_, std::try_to_lock);
++        if (!flow_lock.owns_lock()) throw std::invalid_argument("Active flow prevents general resize");
++        check_raw_scope();
++        const auto sizes = validate_raw_state(state, host_limit);
++        if (!d_row_timestamps_ || !state.per_row_ages || !this->config_.vmm_storage ||
++            state.row_bytes != this->config_.embed_width_in_bytes ||
++            state.num_sets > this->config_.vmm_storage->max_sets() ||
++            sizes.data > this->config_.vmm_storage->mapped_bytes() ||
++            state.global_ts != global_ts_ || state.decay_rate != this->config_.decay_rate)
++            throw std::invalid_argument("General resize target is incompatible");
++        std::vector<uint8_t> scratch(8 << 20);
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaDeviceSynchronize());
++        raw_restore_incomplete_ = true;
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(this->cache_, state.data.data(), sizes.data, cudaMemcpyHostToDevice));
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(d_counters_, state.counters.data(), sizes.counters, cudaMemcpyHostToDevice));
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(d_row_timestamps_, state.row_timestamps.data(), sizes.slots * sizeof(int64_t), cudaMemcpyHostToDevice));
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(d_set_timestamps_, state.set_timestamps.data(), sizes.timestamps, cudaMemcpyHostToDevice));
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(this->d_tags_, state.tags.data(), sizes.tags, cudaMemcpyHostToDevice));
++        // Bounded byte-for-byte readback: no third full host snapshot.
++        const auto verify = [&](const void* device, const void* expected, size_t bytes) {
++            for (size_t first = 0; first < bytes; first += scratch.size()) {
++                const size_t count = std::min(scratch.size(), bytes - first);
++                CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(scratch.data(), static_cast<const uint8_t*>(device) + first,
++                    count, cudaMemcpyDeviceToHost));
++                if (std::memcmp(scratch.data(), static_cast<const uint8_t*>(expected) + first, count))
++                    throw std::runtime_error("General resize readback mismatch");
++            }
++        };
++        verify(this->cache_, state.data.data(), sizes.data);
++        verify(this->d_tags_, state.tags.data(), sizes.tags);
++        verify(d_counters_, state.counters.data(), sizes.counters);
++        verify(d_row_timestamps_, state.row_timestamps.data(), sizes.slots * sizeof(int64_t));
++        verify(d_set_timestamps_, state.set_timestamps.data(), sizes.timestamps);
++        std::copy(state.tags.begin(), state.tags.end(), this->h_tags_);
++        this->num_sets_ = state.num_sets;
++        this->config_.vmm_active_sets = state.num_sets;
++        this->config_.cache_sz_in_bytes = state.num_sets *
++            (this->get_entry_size_per_set() + this->get_tag_size_per_set() + this->get_counter_size_per_set());
++        raw_restore_allowed_ = false;
++        raw_restore_incomplete_ = false;
++    }
++
++    int64_t raw_row_metadata_to_host(bool caller_quiesced, uint64_t expected_sets,
++                                     void* tags_out, void* counterbits_out, void* ages_out) {
++        if (!caller_quiesced || !d_row_timestamps_) throw std::invalid_argument("Per-row metadata requires general mode");
++        std::lock_guard<std::mutex> lock(modify_mutex_);
++        typename EmbedCacheSA<IndexT, TagT>::WriteLock flow_lock(this->custom_flow_mutex_, std::try_to_lock);
++        if (!flow_lock.owns_lock()) throw std::invalid_argument("Active flow prevents row metadata export");
++        check_raw_scope();
++        if (expected_sets != this->num_sets_ || !tags_out || !counterbits_out || !ages_out)
++            throw std::invalid_argument("Per-row metadata geometry or pointers are invalid");
++        const size_t slots = raw_product(expected_sets, NUM_WAYS);
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaDeviceSynchronize());
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(tags_out, this->d_tags_, slots * sizeof(TagT), cudaMemcpyDeviceToHost));
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(counterbits_out, d_counters_, slots * sizeof(CounterT), cudaMemcpyDeviceToHost));
++        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(ages_out, d_row_timestamps_, slots * sizeof(int64_t), cudaMemcpyDeviceToHost));
++        return global_ts_;
++    }
 +
 +    // Diagnostics only: copy metadata into caller-owned HOST buffers sized for
 +    // expected_sets*8 tags/counters and expected_sets timestamps. No values are
@@ -211,7 +462,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +        raw_restore_incomplete_ = true;
 +        vmm_factor2_migrate(this->cache_, reinterpret_cast<int64_t*>(this->d_tags_),
 +            d_counters_, d_set_timestamps_, this->config_.embed_width_in_bytes,
-+            this->num_sets_, new_sets);
++            this->num_sets_, new_sets, this->config_.policy_observation.get(), global_ts_);
 +        this->num_sets_ = new_sets;
 +        this->config_.vmm_active_sets = new_sets;
 +        this->config_.cache_sz_in_bytes = nominal_bytes;
@@ -260,7 +511,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +            // this view without releasing allocations behind another owner.
 +            this->d_pool_ = nullptr; this->h_pool_ = nullptr;
 +            this->cache_ = nullptr; this->d_tags_ = nullptr; this->h_tags_ = nullptr;
-+            d_counters_ = nullptr; d_set_timestamps_ = nullptr; raw_initialized_ = false;
++            d_counters_ = nullptr; d_set_timestamps_ = nullptr; d_row_timestamps_ = nullptr; raw_initialized_ = false;
 +            return;
 +        }
 +        auto device_pool = this->d_pool_; this->d_pool_ = nullptr;
@@ -291,17 +542,20 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +        state.sentinel = this->config_.sentinel_key;
 +        state.decay_rate = this->config_.decay_rate;
 +        state.global_ts = global_ts_;
++        state.per_row_ages = d_row_timestamps_ != nullptr;
 +        const auto sizes = raw_sizes(state, max_host_bytes);
 +        state.tags.resize(sizes.slots);
 +        state.data.resize(sizes.data);
 +        state.counters.resize(sizes.slots);
 +        state.set_timestamps.resize(state.num_sets);
++        if (state.per_row_ages) state.row_timestamps.resize(sizes.slots);
 +        check_raw_host_capacity(state, max_host_bytes);
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaDeviceSynchronize());
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(state.tags.data(), this->d_tags_, sizes.tags, cudaMemcpyDeviceToHost));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(state.data.data(), this->cache_, sizes.data, cudaMemcpyDeviceToHost));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(state.counters.data(), d_counters_, sizes.counters, cudaMemcpyDeviceToHost));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(state.set_timestamps.data(), d_set_timestamps_, sizes.timestamps, cudaMemcpyDeviceToHost));
++        if (state.per_row_ages) CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(state.row_timestamps.data(), d_row_timestamps_, sizes.slots * sizeof(int64_t), cudaMemcpyDeviceToHost));
 +        validate_raw_state(state, max_host_bytes);
 +        return state;
 +    }
@@ -352,6 +606,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(this->cache_, state.data.data(), sizes.data, cudaMemcpyHostToDevice));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(d_counters_, state.counters.data(), sizes.counters, cudaMemcpyHostToDevice));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(d_set_timestamps_, state.set_timestamps.data(), sizes.timestamps, cudaMemcpyHostToDevice));
++        if (state.per_row_ages) CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(d_row_timestamps_, state.row_timestamps.data(), sizes.slots * sizeof(int64_t), cudaMemcpyHostToDevice));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemcpy(this->d_tags_, state.tags.data(), sizes.tags, cudaMemcpyHostToDevice));
 +        CACHE_CUDA_ERR_CHK_AND_THROW(cudaDeviceSynchronize());
 +        global_ts_ = state.global_ts;
@@ -377,7 +632,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
              // check errors
              CHECK_ERR_AND_THROW(this->allocator_->host_allocate((void**)&context, sizeof(ModifyContext)));
              memset(context, 0, sizeof(ModifyContext));
-@@ -207,6 +460,8 @@
+@@ -207,11 +572,17 @@
          try
          {
              std::lock_guard<std::mutex> lock(modify_mutex_);
@@ -386,7 +641,16 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
              CACHE_CUDA_ERR_CHK_AND_THROW(call_fill_tags<TagT>(this->d_tags_, this->num_sets_ * NUM_WAYS * this->config_.num_tables, this->config_.sentinel_key, stream));
              // reset lazy-decay clock and per-set timestamps
              global_ts_ = 0;
-@@ -235,6 +490,11 @@
+             if (d_set_timestamps_ != nullptr) {
+                 CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemsetAsync(d_set_timestamps_, 0, this->config_.num_tables * this->num_sets_ * sizeof(int64_t), stream));
++            }
++            if (d_row_timestamps_ != nullptr) {
++                CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemsetAsync(d_row_timestamps_, 0,
++                    this->config_.num_tables * this->num_sets_ * NUM_WAYS * sizeof(int64_t), stream));
+             }
+             return ECERROR_SUCCESS;
+         }
+@@ -235,6 +606,11 @@
          try
          {
              std::lock_guard<std::mutex> lock(modify_mutex_);
@@ -398,7 +662,26 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
  
              ModifyContext* context = (ModifyContext*)modify_context_handle.handle;
              if (!context)
-@@ -425,6 +685,120 @@
+@@ -270,7 +646,17 @@
+                 context->max_update_sz,
+                 context->d_list,
+                 this->config_.sentinel_key,
+-                stream)));
++                stream, d_row_timestamps_)));
++
++            if (auto observation = this->config_.policy_observation; observation && num_keys) {
++                // max_update_sz is uint32: the bounded grid is at most 2^24.
++                policy_record_replacements<ModifyList, ModifyEntry, TagT, NUM_WAYS><<<
++                    static_cast<unsigned>((std::min<size_t>(num_keys, context->max_update_sz) + 255) / 256), 256, 0, stream>>>(
++                    context->d_list, context->d_entries, context->max_update_sz, dst_tags,
++                    this->num_sets_, this->config_.sentinel_key, observation->header(),
++                    observation->events(), observation->capacity(), global_ts_);
++                CACHE_CUDA_ERR_CHK_AND_THROW(cudaGetLastError());
++            }
+ 
+             invalidate_tags_and_sync(context, num_keys, dst_tags, sync_event, stream);
+ 
+@@ -425,6 +811,126 @@
  
  private:
  
@@ -436,6 +719,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +        sizes.timestamps = raw_product(static_cast<size_t>(state.num_sets), sizeof(int64_t));
 +        for (size_t bytes : {RAW_FIXED_HOST_BYTES, sizes.tags, sizes.data, sizes.counters, sizes.timestamps})
 +            raw_charge(max_host_bytes, bytes);
++        if (state.per_row_ages) raw_charge(max_host_bytes, raw_product(sizes.slots, sizeof(int64_t)));
 +        return sizes;
 +    }
 +
@@ -445,7 +729,9 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +                            raw_product(state.tags.capacity(), sizeof(TagT)),
 +                            state.data.capacity(),
 +                            raw_product(state.counters.capacity(), sizeof(CounterT)),
-+                            raw_product(state.set_timestamps.capacity(), sizeof(int64_t))})
++                            raw_product(state.set_timestamps.capacity(), sizeof(int64_t)),
++                            raw_product(state.row_timestamps.capacity(), sizeof(int64_t)),
++                            raw_product(state.effective_scores.capacity(), sizeof(float))})
 +            raw_charge(max_host_bytes, bytes);
 +    }
 +
@@ -453,7 +739,8 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +    {
 +        const auto sizes = raw_sizes(state, max_host_bytes);
 +        if (state.tags.size() != sizes.slots || state.data.size() != sizes.data ||
-+            state.counters.size() != sizes.slots || state.set_timestamps.size() != state.num_sets)
++            state.counters.size() != sizes.slots || state.set_timestamps.size() != state.num_sets ||
++            (state.per_row_ages && state.row_timestamps.size() != sizes.slots))
 +            throw std::invalid_argument("Raw state vector sizes do not match geometry");
 +        check_raw_host_capacity(state, max_host_bytes);
 +        for (size_t set = 0; set < state.num_sets; ++set) {
@@ -461,6 +748,8 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +                throw std::invalid_argument("Raw set timestamp is outside the global clock");
 +            for (size_t way = 0; way < NUM_WAYS; ++way) {
 +                const size_t slot = set * NUM_WAYS + way;
++                if (state.per_row_ages && (state.row_timestamps[slot] < 0 || state.row_timestamps[slot] > state.global_ts))
++                    throw std::invalid_argument("Raw row timestamp is outside the global clock");
 +                if (!std::isfinite(state.counters[slot]) || state.counters[slot] < 0)
 +                    throw std::invalid_argument("Raw counters must be finite and nonnegative");
 +                const TagT tag = state.tags[slot];
@@ -519,7 +808,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
      ECError invalidate_tags_and_sync(const ModifyContext* context,
                                    size_t num_entries,
                                    TagT* tags,
-@@ -463,10 +837,23 @@
+@@ -463,10 +969,25 @@
          assert(this->num_sets_ > 0);
          size_t ctr_size = num_tables * this->num_sets_ * NUM_WAYS * sizeof(CounterT);
          size_t ts_size  = num_tables * this->num_sets_ * sizeof(int64_t);
@@ -528,8 +817,10 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
 +                throw std::invalid_argument("Invalid borrowed VMM metadata geometry");
 +            d_counters_ = this->config_.vmm_storage->counters();
 +            d_set_timestamps_ = this->config_.vmm_storage->timestamps();
++            d_row_timestamps_ = this->config_.vmm_storage->row_timestamps();
 +            CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(d_counters_, 0, ctr_size));
 +            CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(d_set_timestamps_, 0, ts_size));
++            if (d_row_timestamps_) CACHE_CUDA_ERR_CHK_AND_THROW(cudaMemset(d_row_timestamps_, 0, ts_size * NUM_WAYS));
 +            CACHE_CUDA_ERR_CHK_AND_THROW(cudaGetDevice(&raw_device_));
 +            raw_initialized_ = true;
 +            return;
@@ -543,7 +834,7 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
      }
  
      virtual size_t get_counter_size_per_set() const override {
-@@ -474,6 +861,10 @@
+@@ -474,6 +995,10 @@
      }
  
      mutable std::mutex modify_mutex_;
@@ -554,16 +845,69 @@ diff --git a/include/ecache/ec_set_associative_device_modify.cuh b/include/ecach
      CounterT* d_counters_ = nullptr; // device allocated counters to modify
  
      // the last call that touched each set. A set's counters are decayed by
+@@ -481,5 +1006,6 @@
+     // guarded by modify_mutex_.
+     int64_t global_ts_ = 0;
+     int64_t* d_set_timestamps_ = nullptr; // one timestamp per set, allocated from the extras pool
++    int64_t* d_row_timestamps_ = nullptr; // General mode: preserve each row's original lazy-decay epoch.
+ };
+ }
+diff --git a/include/ecache/ec_set_associative_modify.cuh b/include/ecache/ec_set_associative_modify.cuh
+--- a/include/ecache/ec_set_associative_modify.cuh
++++ b/include/ecache/ec_set_associative_modify.cuh
+@@ -21,6 +21,7 @@
+ #include <cub/cub.cuh>
+ #include <bit_ops.hpp>
+ #include "ec_hash.h"
++#include "ec_online_helpers.cuh"
+ 
+ namespace nve {
+ 
+@@ -380,7 +381,8 @@
+     uint32_t max_update_size,
+     void* replace_entries,
+     TagType sentinel_key,
+-    cudaStream_t stream) {
++    cudaStream_t stream,
++    int64_t* row_timestamps = nullptr) {
+         assert (NUM_WAYS <= 32);
+         assert ((NUM_WAYS & (NUM_WAYS - 1)) == 0);
+ 
+@@ -500,6 +502,16 @@
+         auto sets_in_warp = 32 / NUM_WAYS;
+         dim3 gridSize (ceil_div(num_represented_sets, sets_in_warp), 1);
+         dim3 blockSize (NUM_WAYS, sets_in_warp);
++
++        if (row_timestamps && num_represented_sets) {
++            // uint32 set count and at most 32 ways imply at most 2^29 blocks.
++            age_represented_rows<CounterType, NUM_WAYS><<<
++                static_cast<unsigned>((uint64_t(num_represented_sets) * NUM_WAYS + 255) / 256), 256, 0, stream>>>(
++                unique_sets, num_represented_sets, counters, row_timestamps,
++                set_timestamps, global_ts, decay_rate);
++            err = cudaGetLastError();
++            if (err != cudaSuccess) return err;
++        }
+ 
+         SetReplaceDataKernel<KeyType, TagType, CounterType, NUM_WAYS><<<gridSize, blockSize, 0, stream>>>(
+             data_ptrs, keys, unique_sets, offsets, inverse_map,
+@@ -619,4 +631,4 @@
+ 
+     return cudaGetLastError();
+ }
+-}
+\ No newline at end of file
++}
 diff --git a/include/ecache/ec_vmm_rehash.cuh b/include/ecache/ec_vmm_rehash.cuh
 new file mode 100644
 --- /dev/null
 +++ b/include/ecache/ec_vmm_rehash.cuh
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,220 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
 +
 +#include "ec_vmm_rehash_common.hpp"
++#include "ec_policy_observation.hpp"
 +#include <cuda_runtime.h>
 +#include <algorithm>
 +#include <string>
@@ -628,7 +972,8 @@ new file mode 100644
 +template <int = 0>
 +__global__ void migrate_kernel(uint32_t* values, int64_t* tags, uint32_t* counter_bits,
 +    int64_t* timestamps, uint64_t row_words, uint64_t old_sets,
-+    uint64_t new_sets, unsigned tile_words) {
++    uint64_t new_sets, unsigned tile_words, PolicyEventHeader* event_header,
++    PolicyEvictionEvent* events, uint64_t event_capacity, int64_t global_ts) {
 +  const uint64_t group = blockIdx.x;
 +  const bool shrink = new_sets < old_sets;
 +  const unsigned sources = shrink ? 16 : 8;
@@ -667,6 +1012,19 @@ new file mode 100644
 +      }
 +      if (position < 8) source_for_destination[offset + position] = source;
 +      if (counts[side] < 8) ++counts[side];
++    }
++    if (event_header && shrink) {
++      for (unsigned source = 0; source < sources; ++source) {
++        if (source_tags[source] == -1) continue;
++        bool retained = false;
++        for (unsigned destination = 0; destination < 8; ++destination)
++          if (source_for_destination[destination] == int(source)) retained = true;
++        if (!retained) {
++          const auto position = atomicAdd(&event_header->total, 1ULL);
++          atomicAdd(&event_header->capacity, 1ULL);
++          if (position < event_capacity) events[position] = {int64_t(source_keys[source]), global_ts, 1};
++        }
++      }
 +    }
 +  }
 +  __syncthreads();
@@ -740,7 +1098,8 @@ new file mode 100644
 +// Call only after a successful preflight under the same exclusive barrier.
 +// Growth destination backing must already exist; shrink tail must stay mapped.
 +inline void vmm_factor2_migrate(int8_t* values, int64_t* tags, float* counters,
-+    int64_t* timestamps, uint64_t row_bytes, uint64_t old_sets, uint64_t new_sets) {
++    int64_t* timestamps, uint64_t row_bytes, uint64_t old_sets, uint64_t new_sets,
++    NvEmbPolicyObservation* observation = nullptr, int64_t global_ts = 0) {
 +  using namespace vmm_rehash_detail;
 +  const int direction = vmm_rehash_direction(old_sets, new_sets);
 +  if (!direction) return;
@@ -756,7 +1115,9 @@ new file mode 100644
 +      std::min<uint64_t>(512, uint64_t(shared_limit - 1024) / (16 * sizeof(uint32_t)))));
 +  migrate_kernel<><<<unsigned(groups), kThreads, 16 * size_t(tile_words) * sizeof(uint32_t)>>>(
 +      reinterpret_cast<uint32_t*>(values), tags, reinterpret_cast<uint32_t*>(counters),
-+      timestamps, row_bytes / 4, old_sets, new_sets, tile_words);
++      timestamps, row_bytes / 4, old_sets, new_sets, tile_words,
++      observation ? observation->header() : nullptr, observation ? observation->events() : nullptr,
++      observation ? observation->capacity() : 0, global_ts);
 +  checked(cudaGetLastError(), "rehash migration launch");
 +  checked(cudaDeviceSynchronize(), "rehash migration completion");
 +}
@@ -815,7 +1176,7 @@ diff --git a/include/ecache/ec_vmm_storage.hpp b/include/ecache/ec_vmm_storage.h
 new file mode 100644
 --- /dev/null
 +++ b/include/ecache/ec_vmm_storage.hpp
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,254 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
@@ -841,9 +1202,9 @@ new file mode 100644
 +class NvEmbVmmStorage {
 + public:
 +  NvEmbVmmStorage(std::shared_ptr<Allocator> allocator, int device, size_t row_bytes,
-+                  size_t maximum_payload_bytes, size_t chunk_bytes)
++                  size_t maximum_payload_bytes, size_t chunk_bytes, bool row_ages = false)
 +      : allocator_(std::move(allocator)), device_(device), row_bytes_(row_bytes),
-+        chunk_bytes_(chunk_bytes), reserved_bytes_(maximum_payload_bytes) {
++        chunk_bytes_(chunk_bytes), reserved_bytes_(maximum_payload_bytes), row_ages_enabled_(row_ages) {
 +    if (!allocator_ || !row_bytes || row_bytes % 16 || !chunk_bytes ||
 +        row_bytes > std::numeric_limits<size_t>::max() / 8 ||
 +        maximum_payload_bytes == 0 || maximum_payload_bytes % (8 * row_bytes) ||
@@ -859,8 +1220,10 @@ new file mode 100644
 +      throw std::invalid_argument("NVEmb VMM metadata byte count overflow");
 +    counter_offset_ = tags;
 +    age_offset_ = tags + counters;
-+    scratch_offset_ = ((tags + counters + ages + 15) / 16) * 16;
-+    fixed_device_bytes_ = scratch_offset_ + 64;
++    row_age_offset_ = tags + counters + ages;
++    scratch_offset_ = ((row_age_offset_ + (row_ages ? tags : 0) + 15) / 16) * 16;
++    scratch_bytes_ = row_ages ? 65536 * sizeof(float) : 64;
++    fixed_device_bytes_ = scratch_offset_ + scratch_bytes_;
 +    fixed_host_bytes_ = tags;
 +    try {
 +      int current_device = -1;
@@ -898,8 +1261,10 @@ new file mode 100644
 +  int64_t* tags() const { return reinterpret_cast<int64_t*>(metadata_); }
 +  float* counters() const { return reinterpret_cast<float*>(metadata_ + counter_offset_); }
 +  int64_t* timestamps() const { return reinterpret_cast<int64_t*>(metadata_ + age_offset_); }
++  int64_t* row_timestamps() const { return row_ages_enabled_ ? reinterpret_cast<int64_t*>(metadata_ + row_age_offset_) : nullptr; }
 +  int64_t* host_tags() const { return host_tags_; }
 +  void* rehash_scratch() const { return metadata_ + scratch_offset_; }
++  size_t scratch_bytes() const { return scratch_bytes_; }
 +  uint64_t max_sets() const { return max_sets_; }
 +  size_t row_bytes() const { return row_bytes_; }
 +  size_t mapped_bytes() const { return mapped_bytes_; }
@@ -1053,8 +1418,9 @@ new file mode 100644
 +  std::shared_ptr<Allocator> allocator_;
 +  int device_;
 +  size_t row_bytes_, chunk_bytes_, reserved_bytes_;
++  bool row_ages_enabled_ = false;
 +  uint64_t max_sets_ = 0;
-+  size_t counter_offset_ = 0, age_offset_ = 0, scratch_offset_ = 0;
++  size_t counter_offset_ = 0, age_offset_ = 0, row_age_offset_ = 0, scratch_offset_ = 0, scratch_bytes_ = 0;
 +  size_t fixed_device_bytes_ = 0, fixed_host_bytes_ = 0, granularity_ = 0;
 +  size_t mapped_bytes_ = 0, allocated_bytes_ = 0;
 +  CUcontext context_ = nullptr;
@@ -1068,7 +1434,7 @@ new file mode 100644
 diff --git a/include/gpu_table.hpp b/include/gpu_table.hpp
 --- a/include/gpu_table.hpp
 +++ b/include/gpu_table.hpp
-@@ -304,8 +304,22 @@
+@@ -304,8 +304,27 @@
     */
    virtual DataType_t get_value_type() const override;
  
@@ -1076,6 +1442,9 @@ diff --git a/include/gpu_table.hpp b/include/gpu_table.hpp
 +  // drain all hierarchy workers and drop old execution contexts before apply.
 +  std::string cache_resize_state() const;
 +  std::string cache_resize_occupancy();
++  std::string cache_policy_observation(bool reset);
++  std::string cache_resize_row_metadata(uint64_t expected_sets, void* tags_out,
++                                        void* counterbits_out, void* row_ages_out);
 +  std::string cache_resize_metadata(uint64_t expected_sets, void* tags_out,
 +                                    void* counterbits_out, void* ages_out);
 +  void poison_cache_resize() noexcept { resize_poisoned_ = true; }
@@ -1089,18 +1458,23 @@ diff --git a/include/gpu_table.hpp b/include/gpu_table.hpp
 +  bool resize_poisoned_ = false;
 +  std::shared_ptr<NvEmbVmmStorage> vmm_storage_;
 +  bool vmm_fast_rehash_ = true;
++  bool vmm_general_rehash_ = false;
++  std::shared_ptr<NvEmbPolicyObservation> policy_observation_;
  
    allocator_ptr_t allocator_;
    std::shared_ptr<CacheType> cache_;
 diff --git a/include/hierarchical_embedding_layer.hpp b/include/hierarchical_embedding_layer.hpp
 --- a/include/hierarchical_embedding_layer.hpp
 +++ b/include/hierarchical_embedding_layer.hpp
-@@ -81,6 +81,13 @@
+@@ -81,6 +81,16 @@
    int64_t get_num_tables() const override;
  
    inline const Config& get_config() const { return config_; }
 +  std::string cache_resize_state() const;
 +  std::string cache_resize_occupancy();
++  std::string cache_policy_observation(bool reset);
++  std::string cache_resize_row_metadata(uint64_t expected_sets, void* tags_out,
++                                        void* counterbits_out, void* row_ages_out);
 +  std::string cache_resize_metadata(uint64_t expected_sets, void* tags_out,
 +                                    void* counterbits_out, void* ages_out);
 +  void poison_cache_resize();
@@ -1124,11 +1498,114 @@ diff --git a/include/layer_utils.hpp b/include/layer_utils.hpp
  
  private:
    TestableMutex insert_lock_; // lock to prevent parallel auto-insert handling and modify parallel to auto-insert
+diff --git a/include/nvemb_general_rehash.hpp b/include/nvemb_general_rehash.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/nvemb_general_rehash.hpp
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++#include "ecache/ec_vmm_rehash_common.hpp"
++
++namespace nve {
++inline size_t general_product(size_t a, size_t b) {
++  if (b && a > std::numeric_limits<size_t>::max() / b) throw std::invalid_argument("general_geometry_overflow");
++  return a * b;
++}
++template<class Raw>
++size_t general_host_bound(size_t old_sets, size_t new_sets, size_t row) {
++  size_t total = 2 * sizeof(Raw) + (8 << 20);
++  const auto charge = [&](size_t value) {
++    if (value > std::numeric_limits<size_t>::max() - total) throw std::invalid_argument("general_staging_overflow");
++    total += value;
++  };
++  // Old/target values and metadata, old effective scores, ranking entries,
++  // worst-case eviction IDs and temporary event records, bounded readback.
++  charge(general_product(general_product(old_sets, 8), row + 8 + 4 + 8 + 4 + 32 + 8 + 24));
++  charge(general_product(general_product(new_sets, 8), row + 8 + 4 + 8));
++  charge(general_product(old_sets, 8)); charge(general_product(new_sets, 8));
++  return total;
++}
++template<class Raw> struct GeneralRehashPlan {
++  Raw target;
++  size_t occupied_rows = 0, survivor_rows = 0, host_peak_bound = 0;
++  std::vector<int64_t> evicted_keys;
++};
++
++// Effective scores are calculated read-only by CUDA with the same expression
++// as native lazy decay. Raw counters and row ages themselves never normalize.
++template<class Raw>
++GeneralRehashPlan<Raw> plan_general_rehash(const Raw& old, size_t sets, size_t host_limit) {
++  const auto require = [](bool ok, const char* reason) { if (!ok) throw std::invalid_argument(reason); };
++  require(sets && sets <= UINT32_MAX && old.num_sets && old.num_sets <= UINT32_MAX,
++          "unsupported_set_count");
++  require(old.ways == 8 && old.sentinel == -1 && old.row_bytes && old.row_bytes <= UINT32_MAX &&
++          old.row_bytes % 16 == 0 && old.global_ts >= 0, "unsupported_general_geometry");
++  const size_t bound = general_host_bound<Raw>(old.num_sets, sets, old.row_bytes);
++  require(bound <= host_limit, "host_staging_budget");
++  const size_t old_slots = general_product(old.num_sets, 8), slots = general_product(sets, 8);
++  require(old.tags.size() == old_slots && old.counters.size() == old_slots &&
++          old.row_timestamps.size() == old_slots && old.effective_scores.size() == old_slots &&
++          old.data.size() == general_product(old_slots, old.row_bytes), "invalid_general_shape");
++  struct Entry { uint64_t key; size_t source, destination; uint32_t score_bits; };
++  static_assert(sizeof(Entry) <= 32, "Host bound includes each ranking entry");
++  std::vector<Entry> entries; entries.reserve(old_slots);
++  for (size_t slot = 0; slot < old_slots; ++slot) {
++    if (old.tags[slot] == old.sentinel) continue;
++    const size_t source_set = slot / 8;
++    require(old.tags[slot] >= 0 && uint64_t(old.tags[slot]) <= (uint64_t(INT64_MAX) - source_set) / old.num_sets,
++            "invalid_general_key");
++    require(old.row_timestamps[slot] >= 0 && old.row_timestamps[slot] <= old.global_ts, "invalid_row_age");
++    uint32_t score, raw; std::memcpy(&score, &old.effective_scores[slot], 4); std::memcpy(&raw, &old.counters[slot], 4);
++    require(vmm_rehash_valid_counter(score) && vmm_rehash_valid_counter(raw), "invalid_general_counter");
++    for (size_t previous = source_set * 8; previous < slot; ++previous)
++      require(old.tags[previous] != old.tags[slot], "duplicate_key");
++    const uint64_t key = uint64_t(old.tags[slot]) * old.num_sets + source_set;
++    entries.push_back({key, slot, size_t(key % sets), score});
++  }
++  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
++    return a.destination != b.destination ? a.destination < b.destination :
++      vmm_rehash_better_bits(a.score_bits, a.key, b.score_bits, b.key);
++  });
++  GeneralRehashPlan<Raw> plan;
++  plan.host_peak_bound = bound; plan.occupied_rows = entries.size(); plan.evicted_keys.reserve(old_slots);
++  auto& target = plan.target;
++  target.row_bytes = old.row_bytes; target.num_sets = sets; target.ways = 8;
++  target.sentinel = old.sentinel; target.decay_rate = old.decay_rate; target.global_ts = old.global_ts;
++  target.per_row_ages = true;
++  target.tags.assign(slots, -1); target.data.resize(general_product(slots, old.row_bytes));
++  target.counters.assign(slots, 0); target.row_timestamps.assign(slots, 0); target.set_timestamps.assign(sets, 0);
++  for (size_t first = 0; first < entries.size();) {
++    size_t end = first + 1;
++    while (end < entries.size() && entries[end].destination == entries[first].destination) ++end;
++    for (size_t i = first; i < end; ++i) {
++      const auto& entry = entries[i];
++      if (i - first >= 8) { plan.evicted_keys.push_back(int64_t(entry.key)); continue; }
++      const size_t slot = entry.destination * 8 + i - first;
++      target.tags[slot] = int64_t(entry.key / sets);
++      std::memcpy(&target.counters[slot], &old.counters[entry.source], sizeof(float));
++      target.row_timestamps[slot] = old.row_timestamps[entry.source];
++      target.set_timestamps[entry.destination] = old.global_ts;
++      std::copy_n(old.data.data() + entry.source * old.row_bytes, old.row_bytes,
++                  target.data.data() + slot * old.row_bytes);
++      ++plan.survivor_rows;
++    }
++    first = end;
++  }
++  return plan;
++}
++}  // namespace nve
 diff --git a/include/nvemb_rehash.hpp b/include/nvemb_rehash.hpp
 new file mode 100644
 --- /dev/null
 +++ b/include/nvemb_rehash.hpp
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,126 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
@@ -1147,10 +1624,12 @@ new file mode 100644
 +  size_t survivor_rows = 0;
 +  size_t evicted_rows = 0;
 +  size_t host_peak_bound = 0;
++  std::vector<int64_t> evicted_keys;
 +};
 +
 +template<class Raw>
-+PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t host_limit) {
++PreservingRehash<Raw> plan_preserving_rehash(const Raw& old, size_t sets, size_t host_limit,
++                                           bool collect_evictions = false) {
 +  const auto require = [](bool ok, const char* reason) {
 +    if (!ok) throw std::invalid_argument(reason);
 +  };
@@ -1194,6 +1673,7 @@ new file mode 100644
 +  for (int i = 0; i < 2; ++i)
 +    for (size_t bytes : {sizeof(Raw), target_values, target_tags, target_counters, target_ages}) charge(bytes);
 +  charge(product(old_slots, sizeof(Entry))); charge(3072);
++  if (collect_evictions) charge(product(old_slots, sizeof(int64_t)));
 +  std::vector<Entry> entries;
 +  entries.reserve(old_slots);
 +  for (size_t slot = 0; slot < old_slots; ++slot) {
@@ -1222,6 +1702,7 @@ new file mode 100644
 +    i = end;
 +  }
 +  PreservingRehash<Raw> plan;
++  if (collect_evictions) plan.evicted_keys.reserve(old_slots);
 +  auto& target = plan.target;
 +  target.row_bytes = row; target.num_sets = sets; target.ways = ways;
 +  target.sentinel = old.sentinel; target.decay_rate = old.decay_rate; target.global_ts = old.global_ts;
@@ -1237,12 +1718,16 @@ new file mode 100644
 +      std::copy_n(old.data.data() + e.slot * row, row, target.data.data() + slot * row);
 +      ++plan.survivor_rows;
 +    }
++    if (collect_evictions)
++      for (size_t j = std::min(end, i + ways); j < end; ++j)
++        plan.evicted_keys.push_back(static_cast<int64_t>(entries[j].key));
 +    i = end;
 +  }
 +  plan.evicted_rows = entries.size() - plan.survivor_rows;
 +  remaining = host_limit;
 +  charge(raw_capacity(old)); charge(raw_capacity(target)); charge(raw_capacity(target));
 +  charge(product(entries.capacity(), sizeof(Entry))); charge(3072);
++  charge(product(plan.evicted_keys.capacity(), sizeof(int64_t)));
 +  plan.host_peak_bound = host_limit - remaining;
 +  return plan;
 +}
@@ -1324,7 +1809,14 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
      cudaStream_t modify_stream_ = 0;
      int device_id_ = -1;
      int64_t logging_counter_ = 0;
-@@ -458,6 +485,108 @@
+@@ -452,12 +479,137 @@
+         if (remote) {
+             // we are using a custom table wrapper to be able to do late binding of the parameter server
+             ps_table_ = std::make_shared<PyNVETable>(remote);
++            ps_table_->enable_policy_observation();
+             tables.push_back(ps_table_);
+             insert_heuristic_thresholds.push_back(0.f); // remote PS is typically updated externally instead of by the layer
+         }
          typename layer_type::Config layer_cfg = {"ps_layer", std::make_shared<DefaultInsertHeuristic>(insert_heuristic_thresholds)};
          layer_cfg.default_embedding = config.default_embedding;
          this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, tables, nullptr /* using default allocator for device 0*/);
@@ -1338,7 +1830,10 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +        const auto state = nlohmann::json::parse(layer->cache_resize_state());
 +        const bool vmm = state.value("vmm", false);
 +        return nlohmann::json({{"version", 1},
-+            {"mode", vmm ? "native_nvemb_vmm_original_policy" : "raw_rehash_cpu_staging"},
++            {"mode", state.value("per_row_ages", false) ? "native_nvemb_vmm_general_row_ages" :
++                (vmm ? "native_nvemb_vmm_original_policy" : "raw_rehash_cpu_staging")},
++            {"per_row_ages", state.value("per_row_ages", false)},
++            {"arbitrary_set_geometry", state.value("per_row_ages", false)},
 +            {"preserves_values", true}, {"preserves_counter_bits", true},
 +            {"preserves_pending_inserts", true}, {"vmm", vmm}}).dump();
 +    }
@@ -1353,6 +1848,25 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +        this->wait_contexts();
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
 +        return layer->cache_resize_occupancy();
++    }
++    std::string cache_policy_observation(bool reset = true)
++    {
++        ScopedDevice device(this->device_id_);
++        this->wait_contexts();
++        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
++        auto result = nlohmann::json::parse(layer->cache_policy_observation(reset));
++        if (ps_table_) result.update(ps_table_->policy_observation(reset));
++        else result["ps_find_enabled"] = false;
++        return result.dump();
++    }
++    std::string cache_resize_row_metadata(uint64_t expected_sets, uintptr_t tags_out,
++                                          uintptr_t counterbits_out, uintptr_t row_ages_out)
++    {
++        ScopedDevice device(this->device_id_);
++        this->wait_contexts();
++        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
++        return layer->cache_resize_row_metadata(expected_sets, reinterpret_cast<void*>(tags_out),
++            reinterpret_cast<void*>(counterbits_out), reinterpret_cast<void*>(row_ages_out));
 +    }
 +    std::string plan_cache_resize(size_t payload_bytes, size_t host_limit)
 +    {
@@ -1433,10 +1947,144 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
      }
  
      void set_ps_table(std::shared_ptr<nve::Table>& table)
+diff --git a/python/pynve/bindings/binding_tables.hpp b/python/pynve/bindings/binding_tables.hpp
+--- a/python/pynve/bindings/binding_tables.hpp
++++ b/python/pynve/bindings/binding_tables.hpp
+@@ -18,8 +18,18 @@
+ #pragma once
+ 
+ #include <table.hpp>
++#include <buffer_wrapper.hpp>
++#include <execution_context.hpp>
++#include <algorithm>
++#include <chrono>
++#include <cerrno>
++#include <cstdlib>
++#include <limits>
+ #include <memory>
++#include <mutex>
++#include <stdexcept>
+ #include <string>
++#include <vector>
+ #include <nlohmann/json.hpp>
+ 
+ #include "include/common.hpp"  // NVE_CHECK_
+@@ -35,6 +45,49 @@
+ public:
+     PyNVETable(table_ptr_t table) : table_(std::move(table)) {}
+ 
++    // Enable only the outer hierarchy wrapper. ParameterServerTable itself
++    // inherits PyNVETable too; enabling every constructor would double-count.
++    void enable_policy_observation() {
++        const char* enabled = std::getenv("NVE_NVEMB_POLICY_OBSERVATION");
++        if (!enabled || std::string(enabled) != "1") return;
++        size_t capacity = 65536;
++        if (const char* value = std::getenv("NVE_NVEMB_POLICY_EVENT_CAPACITY")) {
++            char* end = nullptr;
++            errno = 0;
++            const auto parsed = std::strtoull(value, &end, 10);
++            if (*value == '-' || errno || !end || end == value || *end || !parsed ||
++                parsed > std::numeric_limits<size_t>::max())
++                throw std::invalid_argument("Invalid NVE_NVEMB_POLICY_EVENT_CAPACITY");
++            capacity = static_cast<size_t>(parsed);
++        }
++        std::lock_guard<std::mutex> lock(policy_mutex_);
++        if (policy_enabled_) throw std::logic_error("PS policy observation already enabled");
++        policy_keys_.reserve(capacity);
++        policy_capacity_ = capacity;
++        policy_enabled_ = true;
++    }
++
++    nlohmann::json policy_observation(bool reset) {
++        // Binding owner must wait its contexts before snapshot/reset. The lock
++        // additionally protects concurrent native PS calls and publication.
++        std::lock_guard<std::mutex> lock(policy_mutex_);
++        const bool overflow = policy_dropped_ != 0;
++        nlohmann::json result = {{"ps_find_enabled", policy_enabled_},
++            {"ps_find_complete", policy_enabled_ && policy_complete_ && !overflow},
++            {"ps_find_overflow", overflow}, {"ps_find_dropped_key_count", policy_dropped_},
++            {"ps_find_count", policy_rows_}, {"ps_find_calls", policy_calls_},
++            {"ps_find_work_ms", policy_work_ms_}, {"ps_find_keys", policy_keys_},
++            {"ps_find_observation_host_bytes", policy_capacity_ * sizeof(int64_t)},
++            {"ps_find_work_scope", "delegated native CPU find-call walltime; includes its waits; excludes observer key copying and later H2D/scatter"}};
++        if (reset) {
++            policy_rows_ = policy_calls_ = policy_dropped_ = 0;
++            policy_work_ms_ = 0;
++            policy_keys_.clear();
++            policy_complete_ = true;
++        }
++        return result;
++    }
++
+     void clear(context_ptr_t& ctx) override {
+         NVE_CHECK_(table_ != nullptr, "Table is not initialized");
+         table_->clear(ctx);
+@@ -83,7 +136,46 @@
+                  buffer_ptr<bitmask64_t> hit_mask, int64_t value_stride,
+                  buffer_ptr<void> values, buffer_ptr<int64_t> value_sizes) const override {
+         NVE_CHECK_(table_ != nullptr, "Table is not initialized");
+-        table_->find(ctx, n, std::move(keys), std::move(hit_mask), value_stride, std::move(values), std::move(value_sizes));
++        if (!policy_enabled_) {
++            table_->find(ctx, n, std::move(keys), std::move(hit_mask), value_stride, std::move(values), std::move(value_sizes));
++            return;
++        }
++        auto observed_keys = keys;
++        const auto started = std::chrono::steady_clock::now();
++        try {
++            table_->find(ctx, n, std::move(keys), std::move(hit_mask), value_stride, std::move(values), std::move(value_sizes));
++        } catch (...) {
++            std::lock_guard<std::mutex> lock(policy_mutex_);
++            policy_complete_ = false;
++            throw;
++        }
++        const double work_ms = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - started).count();
++        std::lock_guard<std::mutex> lock(policy_mutex_);
++        ++policy_calls_;
++        policy_work_ms_ += work_ms;
++        if (n < 0 || table_->get_key_size() != static_cast<int64_t>(sizeof(int64_t)) || table_->get_device_id() >= 0) {
++            policy_complete_ = false;
++            return;
++        }
++        const auto count = static_cast<uint64_t>(n);
++        policy_rows_ += count;
++        if (!count) return;
++        const size_t retained = static_cast<size_t>(std::min<uint64_t>(
++            count, policy_capacity_ - policy_keys_.size()));
++        policy_dropped_ += count - retained;
++        if (!retained) return;
++        try {
++            // Reuse the CPU buffer consumed by the CPU PS when available.
++            // Any required D2H/sync here is observation overhead, not find work.
++            const auto* host = static_cast<const int64_t*>(observed_keys->access_buffer(
++                cudaMemoryTypeHost, true, ctx->get_lookup_stream()));
++            NVE_CHECK_(cudaStreamSynchronize(ctx->get_lookup_stream()));
++            policy_keys_.insert(policy_keys_.end(), host, host + retained);
++        } catch (...) {
++            policy_complete_ = false;
++            throw;
++        }
+     }
+     void insert(context_ptr_t& ctx, int64_t n, buffer_ptr<const void> keys,
+                    int64_t value_stride, int64_t value_size,
+@@ -111,6 +203,13 @@
+ 
+ private:
+     table_ptr_t table_;
++    bool policy_enabled_ = false;
++    size_t policy_capacity_ = 0;
++    mutable std::mutex policy_mutex_;
++    mutable bool policy_complete_ = true;
++    mutable uint64_t policy_rows_ = 0, policy_calls_ = 0, policy_dropped_ = 0;
++    mutable double policy_work_ms_ = 0;
++    mutable std::vector<int64_t> policy_keys_;
+ };
+ 
+ class ParameterServerTable final : public nve::PyNVETable {
 diff --git a/python/pynve/bindings/python_binding.cu b/python/pynve/bindings/python_binding.cu
 --- a/python/pynve/bindings/python_binding.cu
 +++ b/python/pynve/bindings/python_binding.cu
-@@ -163,7 +163,13 @@
+@@ -163,7 +163,15 @@
  
      py::class_<HierarchicalEmbedding<IndexT>, NVEmbedBinding<IndexT>, std::shared_ptr<HierarchicalEmbedding<IndexT>>> (m, "HierarchicalEmbedding")
          .def(py::init<size_t, nve::DataType_t, uint64_t, uint64_t, table_ptr_t, uint64_t, bool, int, EmbedLayerConfig>())
@@ -1445,6 +2093,8 @@ diff --git a/python/pynve/bindings/python_binding.cu b/python/pynve/bindings/pyt
 +        .def("cache_resize_capabilities", &HierarchicalEmbedding<IndexT>::cache_resize_capabilities)
 +        .def("cache_resize_state", &HierarchicalEmbedding<IndexT>::cache_resize_state)
 +        .def("cache_resize_occupancy", &HierarchicalEmbedding<IndexT>::cache_resize_occupancy, py::call_guard<py::gil_scoped_release>())
++        .def("cache_policy_observation", &HierarchicalEmbedding<IndexT>::cache_policy_observation, py::arg("reset") = true, py::call_guard<py::gil_scoped_release>())
++        .def("cache_resize_row_metadata", &HierarchicalEmbedding<IndexT>::cache_resize_row_metadata, py::call_guard<py::gil_scoped_release>())
 +        .def("cache_resize_metadata", &HierarchicalEmbedding<IndexT>::cache_resize_metadata, py::call_guard<py::gil_scoped_release>())
 +        .def("plan_cache_resize", &HierarchicalEmbedding<IndexT>::plan_cache_resize, py::call_guard<py::gil_scoped_release>())
 +        .def("apply_cache_resize", &HierarchicalEmbedding<IndexT>::apply_cache_resize, py::call_guard<py::gil_scoped_release>());
@@ -1454,11 +2104,12 @@ diff --git a/python/pynve/bindings/python_binding.cu b/python/pynve/bindings/pyt
 diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 --- a/src/gpu_table.cu
 +++ b/src/gpu_table.cu
-@@ -16,6 +16,14 @@
+@@ -16,6 +16,15 @@
   */
  
  #include <gpu_table.hpp>
 +#include <nvemb_rehash.hpp>
++#include <nvemb_general_rehash.hpp>
 +#include <limits>
 +#include <cstring>
 +#include <stdexcept>
@@ -1469,7 +2120,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
  #include <json_support.hpp>
  #include <ecache/embedding_cache_combined.cuh>
  #include <execution_context.hpp>
-@@ -31,6 +39,24 @@
+@@ -31,6 +40,24 @@
  #include "buffer_wrapper.hpp"
  
  namespace nve {
@@ -1494,7 +2145,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
  
  static DataTypeFormat TRSDataToEC(DataType_t dt) {
    switch (dt) {
-@@ -212,6 +238,29 @@
+@@ -212,6 +239,42 @@
    cfg.allocate_data_on_host = config_.data_storage_on_host;
    cfg.sentinel_key = static_cast<KeyType>(config_.invalid_key);
  
@@ -1514,17 +2165,30 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    const auto fast = nvemb_vmm_env_size("NVE_NVEMB_VMM_FAST_REHASH", 1);
 +    if (fast > 1) throw std::invalid_argument("NVE_NVEMB_VMM_FAST_REHASH must be 0 or 1");
 +    vmm_fast_rehash_ = fast != 0;
++    const auto general = nvemb_vmm_env_size("NVE_NVEMB_VMM_GENERAL_REHASH", 0);
++    if (general > 1) throw std::invalid_argument("NVE_NVEMB_VMM_GENERAL_REHASH must be 0 or 1");
++    vmm_general_rehash_ = general != 0;
 +    vmm_storage_ = std::make_shared<NvEmbVmmStorage>(allocator_, config_.device_id, row,
-+        vmm_max_payload, nvemb_vmm_env_size("NVE_NVEMB_VMM_CHUNK_BYTES", 2 * 1024 * 1024));
++        vmm_max_payload, nvemb_vmm_env_size("NVE_NVEMB_VMM_CHUNK_BYTES", 2 * 1024 * 1024), vmm_general_rehash_);
 +    vmm_storage_->resize_values(initial_sets * 8 * row);
 +    cfg.vmm_storage = vmm_storage_;
 +    cfg.vmm_active_sets = initial_sets;
 +  }
 +
++  const auto observation = nvemb_vmm_env_size("NVE_NVEMB_POLICY_OBSERVATION", 0);
++  if (observation > 1) throw std::invalid_argument("NVE_NVEMB_POLICY_OBSERVATION must be 0 or 1");
++  if (observation) {
++    if (!std::is_same_v<KeyType, int64_t> || !config_.modify_on_gpu || config_.uvm_table)
++      throw std::invalid_argument("Policy observation requires int64 device-modify hierarchical cache");
++    policy_observation_ = std::make_shared<NvEmbPolicyObservation>(allocator_,
++        nvemb_vmm_env_size("NVE_NVEMB_POLICY_EVENT_CAPACITY", 65536));
++    cfg.policy_observation = policy_observation_;
++  }
++
    if (config.modify_on_gpu) {
      cache_ = std::make_shared<CacheTypeDevice>(allocator_.get(), GetGlobalLogger(), cfg);
    } else {
-@@ -229,6 +278,244 @@
+@@ -229,6 +292,345 @@
  template <typename KeyType>
  GpuTable<KeyType>::~GpuTable() {
    NVE_CHECK_(contexts_->empty(), "GPUTable destroyed with existing execution contexts");
@@ -1556,7 +2220,8 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +  result["ways"] = DeviceCache::NUM_WAYS;
 +  result["row_bytes"] = config_.row_size_in_bytes;
 +  result["payload_bytes"] = sets * DeviceCache::NUM_WAYS * config_.row_size_in_bytes;
-+  result["device_pool_bytes"] = size.device_allocation_size;
++  result["observation_device_bytes"] = policy_observation_ ? policy_observation_->bytes() : 0;
++  result["device_pool_bytes"] = size.device_allocation_size + (policy_observation_ ? policy_observation_->bytes() : 0);
 +  result["host_pool_bytes"] = size.host_allocation_size;
 +  if (vmm_storage_) {
 +    result["mapped_value_bytes"] = vmm_storage_->mapped_bytes();
@@ -1566,7 +2231,9 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    result["chunk_bytes"] = vmm_storage_->chunk_bytes();
 +    result["value_base_address"] = reinterpret_cast<uintptr_t>(vmm_storage_->values());
 +    result["metadata_accounting"] = "requested_allocator_bytes_including_fixed_rehash_scratch";
-+    result["rehash_mode"] = vmm_fast_rehash_ ? "native_modulo_factor2" : "original_cpu_raw_rehash";
++    result["rehash_mode"] = vmm_general_rehash_ ? "native_modulo_general_row_ages_cpu_staging" :
++        (vmm_fast_rehash_ ? "native_modulo_factor2" : "original_cpu_raw_rehash");
++    result["per_row_ages"] = vmm_general_rehash_;
 +  }
 +  result["budget_scope"] = "cache_pool_only_excludes_execution_workspaces_and_handler_buffers";
 +  return result.dump();
@@ -1588,6 +2255,58 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +  result["occupied_payload_bytes"] = occupied * row_bytes;
 +  result["occupancy_source"] = "synchronized_raw_tag_scan_outside_resize_timing";
 +  return result.dump();
++}
++
++template <typename KeyType>
++std::string GpuTable<KeyType>::cache_policy_observation(bool reset) {
++  if constexpr (!std::is_same_v<KeyType, int64_t>) {
++    throw std::invalid_argument("Policy observations support int64 keys only");
++  } else {
++  ScopedDevice scope(config_.device_id);
++  if (vmm_storage_) vmm_storage_->validate_context();
++  auto state = nlohmann::json::parse(cache_resize_state());
++  NVE_CHECK_(state.value("state", "poisoned") == "ready", "Policy observation requires a usable cache");
++  nlohmann::json result = {{"enabled", bool(policy_observation_)}, {"complete", false}, {"overflow", false},
++      {"resident_rows", nullptr}, {"capacity_rows", state.at("num_sets").template get<uint64_t>() * 8},
++      {"row_bytes", state.at("row_bytes")}, {"generation", resize_generation_},
++      {"admission_eviction_keys", nlohmann::json::array()}, {"admission_eviction_clocks", nlohmann::json::array()},
++      {"capacity_eviction_keys", nlohmann::json::array()}, {"capacity_eviction_clocks", nlohmann::json::array()},
++      {"admission_eviction_count", nullptr}, {"capacity_eviction_count", nullptr},
++      {"dropped_event_count", nullptr}, {"observation_device_bytes", policy_observation_ ? policy_observation_->bytes() : 0}};
++  if (!policy_observation_) return result.dump();
++  using DeviceCache = nve::CacheSADeviceModify<KeyType, KeyType>;
++  auto source = std::dynamic_pointer_cast<DeviceCache>(cache_);
++  const auto observed = source->policy_observation(reset);
++  const auto dropped = observed.header.total > policy_observation_->capacity() ? observed.header.total - policy_observation_->capacity() : 0;
++  result["overflow"] = dropped != 0; result["complete"] = dropped == 0;
++  result["dropped_event_count"] = dropped; result["resident_rows"] = observed.header.resident;
++  result["observation_serial"] = observed.serial; result["global_ts"] = source->raw_global_ts();
++  result["admission_eviction_count"] = observed.header.admission;
++  result["capacity_eviction_count"] = observed.header.capacity;
++  for (const auto& event : observed.events) {
++    result[event.kind ? "capacity_eviction_keys" : "admission_eviction_keys"].push_back(event.key);
++    result[event.kind ? "capacity_eviction_clocks" : "admission_eviction_clocks"].push_back(event.clock);
++  }
++  return result.dump();
++  }
++}
++
++template <typename KeyType>
++std::string GpuTable<KeyType>::cache_resize_row_metadata(uint64_t expected_sets,
++    void* tags_out, void* counterbits_out, void* row_ages_out) {
++  if constexpr (!std::is_same_v<KeyType, int64_t>) {
++    throw std::invalid_argument("Row metadata supports int64 keys only");
++  } else {
++  ScopedDevice scope(config_.device_id);
++  if (vmm_storage_) vmm_storage_->validate_context();
++  auto result = nlohmann::json::parse(cache_resize_state());
++  NVE_CHECK_(vmm_general_rehash_ && !resize_poisoned_, "Row metadata requires usable general VMM mode");
++  using DeviceCache = nve::CacheSADeviceModify<KeyType, KeyType>;
++  auto source = std::dynamic_pointer_cast<DeviceCache>(cache_);
++  result["global_ts"] = source->raw_row_metadata_to_host(true, expected_sets, tags_out, counterbits_out, row_ages_out);
++  result["decay_rate"] = source->raw_decay_rate(); result["age_granularity"] = "row";
++  return result.dump();
++  }
 +}
 +
 +template <typename KeyType>
@@ -1645,6 +2364,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    if (sets > vmm_storage_->max_sets()) return reject("vmm_maximum_payload");
 +    target_pool = vmm_storage_->mapped_bytes_for_payload(sets * ways * row) + vmm_storage_->fixed_device_bytes();
 +  }
++  target_pool += policy_observation_ ? policy_observation_->bytes() : 0;
 +  if (target_pool > pool_limit) return reject("device_pool_budget");
 +  receipt["payload_bytes"] = sets * ways * row;
 +  receipt["device_pool_bytes"] = target_pool;
@@ -1658,6 +2378,49 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    receipt["after"] = before;
 +    receipt["survivor_rows"] = nullptr;
 +    receipt["evicted_rows"] = 0;
++    return receipt.dump();
++  }
++  if (vmm_storage_ && vmm_general_rehash_) {
++    const size_t host_bound = general_host_bound<Raw>(before_sets, sets, row);
++    if (host_bound > host_limit) return reject("host_staging_budget");
++    const auto preflight_start = std::chrono::steady_clock::now();
++    Raw old;
++    GeneralRehashPlan<Raw> plan;
++    try {
++      old = source->export_general_state(true, host_limit);
++      plan = plan_general_rehash(old, sets, host_limit);
++    }
++    catch (const std::invalid_argument& error) { return reject(error.what()); }
++    catch (...) { resize_poisoned_ = true; throw; }
++    receipt["native_preflight_ms"] = nvemb_elapsed_ms(preflight_start);
++    receipt["physical_mode"] = "vmm_native_general_row_ages_cpu_staging";
++    receipt["age_granularity"] = "row";
++    receipt["survivor_rows"] = plan.survivor_rows;
++    receipt["evicted_rows"] = plan.evicted_keys.size();
++    receipt["host_staging_peak_bound_bytes"] = plan.host_peak_bound;
++    receipt["status"] = "planned";
++    if (dry_run) return receipt.dump();
++    old = Raw{};
++    resize_poisoned_ = true;
++    double mapping_ms = 0;
++    if (sets > before_sets) {
++      const auto start = std::chrono::steady_clock::now();
++      vmm_storage_->resize_values(sets * ways * row);
++      mapping_ms += nvemb_elapsed_ms(start);
++    }
++    const auto rewrite_start = std::chrono::steady_clock::now();
++    source->apply_general_state(plan.target, true, host_limit);
++    if (policy_observation_) policy_observation_->append_capacity(plan.evicted_keys, plan.target.global_ts);
++    receipt["native_rehash_ms"] = nvemb_elapsed_ms(rewrite_start);
++    if (sets < before_sets) {
++      const auto start = std::chrono::steady_clock::now();
++      vmm_storage_->resize_values(sets * ways * row);
++      mapping_ms += nvemb_elapsed_ms(start);
++    }
++    receipt["vmm_mapping_ms"] = mapping_ms;
++    config_.cache_size = sets * per_set;
++    ++resize_generation_; resize_poisoned_ = false;
++    receipt["status"] = "applied"; receipt["after"] = nlohmann::json::parse(cache_resize_state());
 +    return receipt.dump();
 +  }
 +  if (vmm_storage_ && vmm_fast_rehash_) {
@@ -1712,7 +2475,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +  Raw old = source->export_raw_state(true, host_limit);
 +  PreservingRehash<Raw> plan;
 +  try {
-+    plan = plan_preserving_rehash(old, sets, host_limit);
++    plan = plan_preserving_rehash(old, sets, host_limit, bool(policy_observation_));
 +  } catch (const std::invalid_argument& error) {
 +    return reject(error.what());
 +  }
@@ -1729,6 +2492,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +  cfg.num_tables = 1; cfg.allocate_data_on_host = false;
 +  cfg.decay_rate = old.decay_rate; cfg.sentinel_key = old.sentinel;
 +  cfg.vmm_storage = vmm_storage_;
++  cfg.policy_observation = policy_observation_;
 +  cfg.vmm_active_sets = vmm_storage_ ? sets : 0;
 +  // Constructing the wrapper allocates no GPU pool. All rejection paths above
 +  // leave the source resident values, counters and pending insert state intact.
@@ -1736,7 +2500,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +  CacheAllocationSize allocation{};
 +  NVE_CHECK_(candidate->calc_allocation_size(allocation));
 +  if (candidate->raw_num_sets_for_config() != sets ||
-+      (!vmm_storage_ && allocation.device_allocation_size != target_pool))
++      (!vmm_storage_ && allocation.device_allocation_size + (policy_observation_ ? policy_observation_->bytes() : 0) != target_pool))
 +    return reject("native_geometry_mismatch");
 +  old = Raw{};
 +  resize_poisoned_ = true;
@@ -1758,6 +2522,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +      checked.counters.size() != target.counters.size() ||
 +      std::memcmp(checked.counters.data(), target.counters.data(), target.counters.size() * sizeof(float)) != 0)
 +    throw std::runtime_error("Native restored state differs from preserving resize plan");
++  if (policy_observation_) policy_observation_->append_capacity(plan.evicted_keys, target.global_ts);
 +  cache_ = candidate;
 +  config_.cache_size = sets * per_set;
 +  ++resize_generation_;
@@ -1769,7 +2534,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
  }
  
  template <typename KeyType>
-@@ -1121,6 +1408,7 @@
+@@ -1121,6 +1523,7 @@
      thread_pool_ptr_t thread_pool,
      allocator_ptr_t allocator) 
  {
@@ -1780,7 +2545,7 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 diff --git a/src/hierarchical_embedding_layer.cu b/src/hierarchical_embedding_layer.cu
 --- a/src/hierarchical_embedding_layer.cu
 +++ b/src/hierarchical_embedding_layer.cu
-@@ -122,6 +122,52 @@
+@@ -122,6 +122,76 @@
  }
  
  template <typename KeyType>
@@ -1795,6 +2560,30 @@ diff --git a/src/hierarchical_embedding_layer.cu b/src/hierarchical_embedding_la
 +  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
 +  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
 +  return table->cache_resize_occupancy();
++}
++
++template <typename KeyType>
++std::string HierarchicalEmbeddingLayer<KeyType>::cache_policy_observation(bool reset) {
++  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
++  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
++  auto handler = handler_at(0);
++  if (handler) handler->lock_modify();
++  try {
++    auto result = table->cache_policy_observation(reset);
++    if (handler) handler->unlock_preserving_resize();
++    return result;
++  } catch (...) {
++    if (handler) handler->unlock_preserving_resize();
++    throw;
++  }
++}
++
++template <typename KeyType>
++std::string HierarchicalEmbeddingLayer<KeyType>::cache_resize_row_metadata(uint64_t expected_sets,
++    void* tags_out, void* counterbits_out, void* row_ages_out) {
++  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
++  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
++  return table->cache_resize_row_metadata(expected_sets, tags_out, counterbits_out, row_ages_out);
 +}
 +
 +template <typename KeyType>

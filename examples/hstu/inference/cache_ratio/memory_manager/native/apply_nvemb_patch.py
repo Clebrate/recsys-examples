@@ -15,10 +15,12 @@ import subprocess
 BASE_FILES = {
     "include/ecache/ec_set_associative.h": "4f0971cda5d166465accf08c6692feff1c340c49ea09e3824871e771716dc94e",
     "include/ecache/ec_set_associative_device_modify.cuh": "d932df44f1e5d025bade9666cf6ebb397862b8bfe21d978e0b52cb396c3730d0",
+    "include/ecache/ec_set_associative_modify.cuh": "c162e9863da155f5183de44e17d04d70288107e12bb797794f9db8c7c22b695a",
     "include/gpu_table.hpp": "4cbf0c3ae6be7ea2745d093efc7f285c8d45dd5e9ee42a6940ce32f45d1ebe34",
     "include/hierarchical_embedding_layer.hpp": "511793fafca4413f76d2b6c45767a94d9db06ffc188625f233d16387ff3b0936",
     "include/layer_utils.hpp": "6e5e847e12e593ca0f8c6fae9a92a6334e6aeeab79a5b6db183c3e951ead866e",
     "python/pynve/bindings/binding_layers.hpp": "2133309145a2078eb22c449bb7ee4e26479a7bad4901df9dd5e1c1a3b819448e",
+    "python/pynve/bindings/binding_tables.hpp": "228b7b1160a84f834ceb3e675bd0d0b1e46a7be7fb6f2f7c36d00fe5124351d8",
     "python/pynve/bindings/python_binding.cu": "2cf00f5e332d0b1d3da391688fd563445f416541f85fe7c26c4870d336758766",
     "src/gpu_table.cu": "76d07b8d50c66f234391d0a99e1ff718ac4bad4b52754e675cd902ceecbaad59",
     "src/hierarchical_embedding_layer.cu": "cd36d71ddb683c515a713d7e5a3bc36ded2ec8ac0d902cf12f13adbc6f531f03"

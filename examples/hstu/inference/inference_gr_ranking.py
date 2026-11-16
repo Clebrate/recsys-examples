@@ -139,6 +139,7 @@ def get_inference_hstu_model(
     cache_memory_backend="default",
     peak_cache_bytes=None,
     host_staging_limit_bytes=256 * 1024**2,
+    vmm_chunk_bytes=None,
 ):
     if cache_memory_backend not in ("default", "vmm"):
         raise ValueError("cache_memory_backend must be 'default' or 'vmm'")
@@ -252,9 +253,15 @@ def get_inference_hstu_model(
         del context_probe
         driver = CudaDriver(torch.cuda.current_device())
         per_layer_page_bytes = bytes_per_page // network_args.num_layers
-        chunk_pages = (
-            math.lcm(per_layer_page_bytes, driver.granularity()) // per_layer_page_bytes
-        )
+        minimum_chunk = math.lcm(per_layer_page_bytes, driver.granularity())
+        chunk_bytes = minimum_chunk if vmm_chunk_bytes is None else vmm_chunk_bytes
+        if (
+            type(chunk_bytes) is not int
+            or chunk_bytes <= 0
+            or chunk_bytes % minimum_chunk
+        ):
+            raise ValueError("VMM chunk must be a positive multiple of page and CUDA granularity")
+        chunk_pages = chunk_bytes // per_layer_page_bytes
         num_primary_cache_pages = (num_primary_cache_pages // chunk_pages) * chunk_pages
         if num_primary_cache_pages < min_pages:
             raise ValueError("VMM-aligned KV budget cannot hold a maximum batch")
@@ -262,7 +269,7 @@ def get_inference_hstu_model(
         kv_payload_bytes = num_primary_cache_pages * bytes_per_page
         embedding_cache_bytes = cache_budget_bytes - kv_payload_bytes
         extra_configs["gpu_backend_factory"] = partial(
-            HstuVmmBackend.from_config, max_pages=max_pages
+            HstuVmmBackend.from_config, max_pages=max_pages, chunk_bytes=chunk_bytes
         )
         memory_options = dict(
             payload_budget_bytes=cache_budget_bytes,
