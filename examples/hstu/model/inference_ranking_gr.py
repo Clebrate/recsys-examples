@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from contextlib import nullcontext
 from typing import Dict
 
 import torch
@@ -133,7 +134,7 @@ class InferenceRankingGR(torch.nn.Module):
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
     ):
-        with torch.inference_mode():
+        with self._cache_batch(), torch.inference_mode():
             # lookup and allocate for kv cache
             index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
                 user_ids,
@@ -166,6 +167,9 @@ class InferenceRankingGR(torch.nn.Module):
                 total_history_lengths,
                 kvcache_info,
             )
+            # Retire views before releasing the resize lock. A later resize
+            # drains CUDA work before changing mappings.
+            del kvcache_info, kvcache_metadata
 
         return logits
 
@@ -173,7 +177,7 @@ class InferenceRankingGR(torch.nn.Module):
         self,
         batch: HSTUBatch,
     ):
-        with torch.inference_mode():
+        with self._cache_batch(), torch.inference_mode():
             torch.cuda.nvtx.range_push("HSTU embedding")
             embeddings = self.sparse_module(batch.features)
             torch.cuda.nvtx.range_pop()
@@ -185,12 +189,20 @@ class InferenceRankingGR(torch.nn.Module):
         self,
         batch: HSTUBatch,
     ):
-        with torch.inference_mode():
+        with self._cache_batch(), torch.inference_mode():
             torch.cuda.nvtx.range_push("HSTU embedding")
             embeddings = self.sparse_module(batch.features)
             torch.cuda.nvtx.range_pop()
             logits = self.dense_module(batch, embeddings)
         return logits
+
+    def _cache_batch(self):
+        memory = getattr(self, "cache_memory", None)
+        if memory is not None:
+            return memory.batch()
+        cache = getattr(self.dense_module, "kvcache", None)
+        backend = getattr(cache, "backend", None)
+        return backend.batch() if hasattr(backend, "batch") else nullcontext()
 
 
 def get_inference_ranking_gr(
@@ -202,7 +214,16 @@ def get_inference_ranking_gr(
     sparse_shareables=None,
     embedding_backend=None,
     gpu_cache_bytes=None,
+    cache_memory_options=None,
 ):
+    if cache_memory_options is not None and (
+        use_cudagraph
+        or kvcache_config is None
+        or not kvcache_config.extra_configs.get("gpu_backend_factory")
+    ):
+        raise ValueError(
+            "Shared dynamic memory requires a GPU-only factory and no CUDA graphs"
+        )
     for ebc_config in task_config.embedding_configs:
         assert (
             ebc_config.dim == hstu_config.hidden_size
@@ -218,6 +239,15 @@ def get_inference_ranking_gr(
         sparse_shareables=sparse_shareables,
         gpu_cache_bytes=gpu_cache_bytes,
     )
+    embedding_memory = None
+    if cache_memory_options is not None:
+        from inference.cache_ratio.memory_manager.nvemb import NvEmbMemoryManager
+
+        # Check native NVEmb support before allocating a VMM KV arena.
+        embedding_memory = NvEmbMemoryManager(
+            inference_sparse._dynamic_embedding_collection,
+            host_staging_limit_bytes=cache_memory_options["host_staging_limit_bytes"],
+        )
     inference_dense = InferenceDenseModule(
         hstu_config,
         kvcache_config,
@@ -226,7 +256,26 @@ def get_inference_ranking_gr(
         cudagraph_configs,
     )
 
-    return InferenceRankingGR(inference_sparse, inference_dense)
+    model = InferenceRankingGR(inference_sparse, inference_dense)
+    if embedding_memory is not None:
+        from inference.cache_ratio.memory_manager.shared import SharedCacheMemory
+
+        backend = inference_dense.kvcache.backend
+        try:
+            model.cache_memory = SharedCacheMemory(
+                backend,
+                embedding_memory,
+                cache_memory_options["payload_budget_bytes"],
+                cache_memory_options["peak_cache_bytes"],
+            )
+        except BaseException as error:
+            try:
+                backend.close(at_batch_barrier=True)
+            except BaseException as cleanup_error:
+                error.cache_cleanup_owner = backend
+                error.cache_cleanup_error = cleanup_error
+            raise
+    return model
 
 
 def apply_inference(

@@ -22,6 +22,8 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <utility>
+#include <algorithm>
+#include <stdexcept>
 
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
 inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -181,6 +183,91 @@ void GPUKVCacheManagerImpl::evict_all()
         _empty_pages.push(page_id);
 };
 
+GPUKVCacheManagerImpl::VmmSnapshot GPUKVCacheManagerImpl::vmm_snapshot() const {
+    if (num_buffer_pages != 0 || total_offloaded_pages != 0 ||
+        !_uid_offload_lock.empty() || !_uid_inference_lock.empty()) {
+        throw std::runtime_error("VMM requires an idle GPU-only page manager");
+    }
+    VmmSnapshot result;
+    std::unordered_set<int> live;
+    for (const auto& item : _uid_to_page_id) {
+        const auto uid = item.first;
+        const int start = _uid_to_paged_cache_startpos.at(uid);
+        const int length = _uid_to_paged_cache_length.at(uid);
+        const auto host = _uid_to_offloaded_length.find(uid);
+        if (start != 0 || (host != _uid_to_offloaded_length.end() && host->second != 0)) {
+            throw std::runtime_error("VMM rejects suffix caches and host backing");
+        }
+        if (length < 0 || item.second.size() !=
+            static_cast<size_t>((length + num_tokens_per_page - 1) / num_tokens_per_page)) {
+            throw std::runtime_error("Invalid VMM prefix page metadata");
+        }
+        for (int page : item.second) {
+            if (page < 0 || page >= num_primary_cache_pages || !live.insert(page).second)
+                throw std::runtime_error("Invalid or duplicate VMM live page ID");
+        }
+        result.emplace_back(uid, start, length, item.second);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+void GPUKVCacheManagerImpl::enable_vmm_events() {
+    vmm_snapshot();
+    _vmm_track_evictions = true;
+}
+
+std::vector<std::pair<int64_t, int>> GPUKVCacheManagerImpl::drain_vmm_capacity_evictions() {
+    std::vector<std::pair<int64_t, int>> result;
+    result.swap(_vmm_capacity_evictions);
+    return result;
+}
+
+std::vector<std::pair<int64_t, int>> GPUKVCacheManagerImpl::resize_vmm_metadata(
+    int target_pages, int expected_pages, const VmmSnapshot& expected) {
+    if (target_pages <= 0 || expected_pages != num_primary_cache_pages ||
+        vmm_snapshot() != expected) {
+        throw std::runtime_error("Stale or invalid VMM resize metadata");
+    }
+    // Prepare all allocation-prone structures before committing. Retain page
+    // IDs verbatim; evict whole users only when their pages intersect the tail.
+    auto pages = _uid_to_page_id;
+    auto starts = _uid_to_paged_cache_startpos;
+    auto lengths = _uid_to_paged_cache_length;
+    auto offloaded = _uid_to_offloaded_length;
+    auto lru = _lru_list;
+    std::vector<std::pair<int64_t, int>> evicted;
+    for (const auto& item : expected) {
+        const auto uid = std::get<0>(item);
+        const auto& ids = std::get<3>(item);
+        if (std::any_of(ids.begin(), ids.end(), [target_pages](int p) { return p >= target_pages; })) {
+            evicted.emplace_back(uid, std::get<2>(item));
+            pages.erase(uid);
+            starts.erase(uid);
+            lengths.erase(uid);
+            offloaded.erase(uid);
+            lru.remove(uid);
+        }
+    }
+    std::unordered_set<int> used;
+    for (const auto& item : pages)
+        used.insert(item.second.begin(), item.second.end());
+    std::queue<int64_t> free;
+    for (int p = 0; p < target_pages; ++p)
+        if (!used.count(p)) free.push(p);
+    decltype(_lru_lookup_table) lru_lookup;
+    for (auto it = lru.begin(); it != lru.end(); ++it) lru_lookup.emplace(*it, it);
+    _uid_to_page_id.swap(pages);
+    _uid_to_paged_cache_startpos.swap(starts);
+    _uid_to_paged_cache_length.swap(lengths);
+    _uid_to_offloaded_length.swap(offloaded);
+    _lru_list.swap(lru);
+    _lru_lookup_table.swap(lru_lookup);
+    _empty_pages.swap(free);
+    num_primary_cache_pages = target_pages;
+    return evicted;
+}
+
 bool GPUKVCacheManagerImpl::retain(int64_t uid)
 {
     auto const tableIt = _lru_lookup_table.find(uid);
@@ -270,6 +357,8 @@ std::vector<int> &GPUKVCacheManagerImpl::alloc_single_sequence(
     }
     while (num_required_pages > _empty_pages.size()) {
         int64_t uid_to_evict = getUIdToEvict(freezed_uids);
+        if (_vmm_track_evictions)
+            _vmm_capacity_evictions.emplace_back(uid_to_evict, _uid_to_paged_cache_length.at(uid_to_evict));
         evict(uid_to_evict);
     }
 

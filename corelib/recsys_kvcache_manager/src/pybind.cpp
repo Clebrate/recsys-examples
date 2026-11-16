@@ -20,6 +20,7 @@
 
 #include "native_host_kvcache_manager_impl.h"
 #include "gpu_kvcache_manager_impl.h"
+#include <pybind11/stl.h>
 
 PYBIND11_MODULE(kvcache_cpp, m) {
   py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl", py::module_local())
@@ -56,6 +57,10 @@ PYBIND11_MODULE(kvcache_cpp, m) {
          py::arg("max_batch_size"),
          py::arg("max_sequence_length"),
          py::arg("device_idx"))
+    .def("_vmm_snapshot", &kvcache::GPUKVCacheManagerImpl::vmm_snapshot)
+    .def("_enable_vmm_events", &kvcache::GPUKVCacheManagerImpl::enable_vmm_events)
+    .def("_drain_vmm_capacity_evictions", &kvcache::GPUKVCacheManagerImpl::drain_vmm_capacity_evictions)
+    .def("_resize_vmm_metadata", &kvcache::GPUKVCacheManagerImpl::resize_vmm_metadata)
     .def("lookup", &kvcache::GPUKVCacheManagerImpl::lookup)
     .def("allocate", &kvcache::GPUKVCacheManagerImpl::allocate)
     .def("evict", &kvcache::GPUKVCacheManagerImpl::evict)

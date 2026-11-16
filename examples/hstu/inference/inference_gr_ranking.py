@@ -136,7 +136,25 @@ def get_inference_hstu_model(
     embedding_backend=None,
     cache_budget_bytes=None,
     kv_cache_ratio=None,
+    cache_memory_backend="default",
+    peak_cache_bytes=None,
+    host_staging_limit_bytes=256 * 1024**2,
 ):
+    if cache_memory_backend not in ("default", "vmm"):
+        raise ValueError("cache_memory_backend must be 'default' or 'vmm'")
+    if cache_memory_backend == "vmm":
+        if (
+            cache_budget_bytes is None
+            or type(peak_cache_bytes) is not int
+            or peak_cache_bytes <= 0
+        ):
+            raise ValueError(
+                "VMM integration requires a payload budget and explicit managed-device-pool peak budget"
+            )
+        if type(host_staging_limit_bytes) is not int or host_staging_limit_bytes <= 0:
+            raise ValueError(
+                "VMM integration requires a positive bounded NVEmb host staging budget"
+            )
     kv_cache_bytes = embedding_cache_bytes = None
     if cache_budget_bytes is not None or kv_cache_ratio is not None:
         if cache_budget_bytes is None or kv_cache_ratio is None:
@@ -221,6 +239,36 @@ def get_inference_hstu_model(
                 f"KV budget holds {num_primary_cache_pages} pages, but a maximum "
                 f"batch requires {min_pages}; increase the budget or reduce batch/sequence size"
             )
+    memory_options = None
+    extra_configs = {}
+    if cache_memory_backend == "vmm":
+        from functools import partial
+        from inference.cache_ratio.memory_manager.cuda_driver import CudaDriver
+        from inference.cache_ratio.memory_manager.hstu import HstuVmmBackend
+
+        # A CUDA context must already exist before Driver API allocation.
+        torch.cuda.init()
+        context_probe = torch.empty(1, device="cuda")
+        del context_probe
+        driver = CudaDriver(torch.cuda.current_device())
+        per_layer_page_bytes = bytes_per_page // network_args.num_layers
+        chunk_pages = (
+            math.lcm(per_layer_page_bytes, driver.granularity()) // per_layer_page_bytes
+        )
+        num_primary_cache_pages = (num_primary_cache_pages // chunk_pages) * chunk_pages
+        if num_primary_cache_pages < min_pages:
+            raise ValueError("VMM-aligned KV budget cannot hold a maximum batch")
+        max_pages = (cache_budget_bytes // bytes_per_page // chunk_pages) * chunk_pages
+        kv_payload_bytes = num_primary_cache_pages * bytes_per_page
+        embedding_cache_bytes = cache_budget_bytes - kv_payload_bytes
+        extra_configs["gpu_backend_factory"] = partial(
+            HstuVmmBackend.from_config, max_pages=max_pages
+        )
+        memory_options = dict(
+            payload_budget_bytes=cache_budget_bytes,
+            peak_cache_bytes=peak_cache_bytes,
+            host_staging_limit_bytes=host_staging_limit_bytes,
+        )
     kvcache_max_seq_len = (
         math.ceil(total_max_seqlen / kvcache_page_size) * kvcache_page_size
     )
@@ -239,14 +287,15 @@ def get_inference_hstu_model(
         "offload_chunksize": 1024,
         "num_primary_cache_pages": num_primary_cache_pages,
         "num_buffer_pages": 0,
-        "host_capacity_per_layer": host_capacity_per_layer,
+        "host_capacity_per_layer": 0 if memory_options else host_capacity_per_layer,
         "max_batch_size": max_batch_size,
         "max_seq_len": kvcache_max_seq_len,
         "dtype": torch.bfloat16,
         "device": torch.cuda.current_device(),
-        "host_kvstorage_backend": "flexkv",
+        "host_kvstorage_backend": "nop" if memory_options else "flexkv",
         "offload_timeout_ms": 100.0,
         "offload_mode": "lazy",
+        "extra_configs": extra_configs,
     }
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
@@ -273,31 +322,49 @@ def get_inference_hstu_model(
         cudagraph_configs=hstu_cudagraph_configs,
         embedding_backend=embedding_backend,
         gpu_cache_bytes=embedding_cache_bytes,
+        cache_memory_options=memory_options,
     )
-    if hstu_config.bf16:
-        model.bfloat16()
-    elif hstu_config.fp16:
-        model.half()
-    model.load_checkpoint(checkpoint_dir)
-    model.eval()
+    try:
+        if hstu_config.bf16:
+            model.bfloat16()
+        elif hstu_config.fp16:
+            model.half()
+        model.load_checkpoint(checkpoint_dir)
+        model.eval()
 
-    dynamic_embeddings = model.sparse_module._dynamic_embedding_collection
-    model.cache_budget_report = {
-        "cache_budget_bytes": cache_budget_bytes,
-        "kv_cache_ratio": kv_cache_ratio,
-        "kv_payload_bytes": (
-            model.dense_module.kvcache.gpu_kvcache_mgr.gpu_kvcache_tensor.nbytes
-            if use_kvcache
-            else 0
-        ),
-        "embedding_gpu_bytes_by_table": getattr(
-            dynamic_embeddings, "gpu_cache_bytes_by_table", None
-        ),
-        "scope": "Cache payload requests; model, static tables and allocator overhead excluded",
-    }
-    if kv_payload_bytes is not None:
-        assert model.cache_budget_report["kv_payload_bytes"] == kv_payload_bytes
-    print("Cache budget:", json.dumps(model.cache_budget_report, sort_keys=True))
+        dynamic_embeddings = model.sparse_module._dynamic_embedding_collection
+        model.cache_budget_report = {
+            "cache_budget_bytes": cache_budget_bytes,
+            "kv_cache_ratio": kv_cache_ratio,
+            "kv_payload_bytes": (
+                sum(
+                    table.nbytes
+                    for table in model.dense_module.kvcache.gpu_kvcache_mgr.gpu_kvcache_tables
+                )
+                if use_kvcache
+                else 0
+            ),
+            "embedding_gpu_bytes_by_table": getattr(
+                dynamic_embeddings, "gpu_cache_bytes_by_table", None
+            ),
+            "scope": "Cache payload requests; model, static tables and allocator overhead excluded",
+        }
+        if kv_payload_bytes is not None:
+            assert model.cache_budget_report["kv_payload_bytes"] == kv_payload_bytes
+        if memory_options:
+            model.cache_budget_report["memory_manager"] = model.cache_memory.stats()
+        print("Cache budget:", json.dumps(model.cache_budget_report, sort_keys=True))
+    except BaseException as error:
+        if memory_options:
+            import traceback
+
+            traceback.clear_frames(error.__traceback__)
+            try:
+                model.cache_memory.close()
+            except BaseException as cleanup_error:
+                error.cache_cleanup_owner = model.cache_memory
+                error.cache_cleanup_error = cleanup_error
+        raise
 
     return model
 

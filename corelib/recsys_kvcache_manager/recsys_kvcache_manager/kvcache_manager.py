@@ -122,4 +122,9 @@ class KVCacheManager:
 
     @classmethod
     def from_config(cls, kvcache_config):
+        factory = kvcache_config.extra_configs.get("gpu_backend_factory")
+        if factory is not None:
+            # The application supplies an explicit owner of the GPU storage.
+            # Do not construct the host/FlexKV backend before replacing it.
+            return cls(factory(kvcache_config))
         return cls(DefaultKVCacheBackend.from_config(kvcache_config))

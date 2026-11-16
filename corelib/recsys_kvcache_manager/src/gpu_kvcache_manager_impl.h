@@ -28,6 +28,7 @@
 #include <torch/serialize/tensor.h>
 
 #include <barrier>
+#include <tuple>
 #include <iomanip>
 #include <iostream>
 #include <list>
@@ -63,6 +64,16 @@ public:
     void evict_offloaded(int64_t uid);
     void evict_all();
     bool retain(int64_t uid);
+
+    // Internal VMM coordinator hooks. They do not allocate/release backing.
+    // Only an exclusive, synchronized GPU-only backend may use these methods.
+    using VmmSnapshot = std::vector<std::tuple<int64_t, int, int, std::vector<int>>>;
+    VmmSnapshot vmm_snapshot() const;
+    void enable_vmm_events();
+    std::vector<std::pair<int64_t, int>> drain_vmm_capacity_evictions();
+    std::vector<std::pair<int64_t, int>> resize_vmm_metadata(
+        int target_pages, int expected_pages, const VmmSnapshot& expected);
+
 
     std::vector<int> &
     alloc_single_sequence(int64_t uid, int new_total_length,
@@ -129,6 +140,8 @@ public:
     std::unordered_set<int64_t> _uid_inference_lock;
 
 public:
+    bool _vmm_track_evictions = false;
+    std::vector<std::pair<int64_t, int>> _vmm_capacity_evictions;
     uint16_t *cache_table;
     at::Device device;  // check for c10::Device
 };

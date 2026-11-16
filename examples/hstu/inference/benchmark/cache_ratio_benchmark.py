@@ -153,9 +153,20 @@ def feature_layout(rows, sequences, contexts, candidate_bound):
 
 
 class HSTU:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        cache_memory_backend="default",
+        peak_cache_bytes=None,
+        host_staging_limit_bytes=256 * 1024**2,
+    ):
         self.model = None
         self.torch = None
+        self.memory_options = dict(
+            cache_memory_backend=cache_memory_backend,
+            peak_cache_bytes=peak_cache_bytes,
+            host_staging_limit_bytes=host_staging_limit_bytes,
+        )
 
     def setup(self, args, manifest, sequences, rows):
         for path in (HSTU_DIR, HSTU_DIR.parent, HSTU_DIR / "model"):
@@ -207,6 +218,7 @@ class HSTU:
                 embedding_backend=EmbeddingBackend.NVEMB,
                 cache_budget_bytes=args.cache_bytes,
                 kv_cache_ratio=args.cache_ratio,
+                **self.memory_options,
             )
             # Populate the CPU parameter servers with actual trace IDs, not 0..N-1.
             history_ends, video_keys = {}, set()
@@ -251,7 +263,9 @@ class HSTU:
                     manifest["seed"] + len(name)
                 )
                 embedding.weight.normal_(mean=0, std=0.02, generator=generator)
-            self.model.dense_module.kvcache.gpu_kvcache_mgr.gpu_kvcache_tensor.zero_()
+            cache = self.model.dense_module.kvcache.gpu_kvcache_mgr
+            for table in cache.gpu_kvcache_tables:
+                table.zero_()
         torch.cuda.synchronize()
         self.event = torch.cuda.Event()
         probes, seen = [], set()
@@ -280,7 +294,9 @@ class HSTU:
             },
             cache_budget=self.model.cache_budget_report,
             budget_scope="cache payload; model/static tables/allocator overhead excluded",
-            host_tier="standard FlexKV",
+            host_tier="none (VMM GPU-only)"
+            if self.memory_options["cache_memory_backend"] == "vmm"
+            else "standard FlexKV",
             torch_version=torch.__version__,
             cuda_version=torch.version.cuda,
             device=torch.cuda.get_device_name(),
@@ -337,8 +353,11 @@ class HSTU:
 
     def close(self):
         if self.model is not None:
-            self.model.dense_module.kvcache.offload_flush()
-            self.torch.cuda.synchronize()
+            if hasattr(self.model, "cache_memory"):
+                self.model.cache_memory.close()
+            else:
+                self.model.dense_module.kvcache.offload_flush()
+                self.torch.cuda.synchronize()
             self.model = None
             gc.collect()
             self.torch.cuda.synchronize()

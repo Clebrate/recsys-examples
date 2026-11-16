@@ -139,6 +139,17 @@ class InferenceDenseModule(torch.nn.Module):
         mlp: Optional[torch.nn.Module] = None,
     ):
         super().__init__()
+        if (
+            use_cudagraph
+            and kvcache_config is not None
+            and (getattr(kvcache_config, "extra_configs", {}) or {}).get(
+                "gpu_backend_factory"
+            )
+            is not None
+        ):
+            raise ValueError(
+                "Application-managed KV storage does not support CUDA graphs"
+            )
         self._device = torch.cuda.current_device()
         self._hstu_config = hstu_config
         self._task_config = task_config
