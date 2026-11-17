@@ -10,7 +10,7 @@ failure the model fails closed; a donor shrink is not a successful ratio move.
 
 from contextlib import contextmanager
 from dataclasses import asdict
-from math import isfinite
+from math import isfinite, lcm
 from threading import RLock
 from time import perf_counter
 
@@ -123,6 +123,25 @@ class SharedCacheMemory:
             old_emb if growing_kv else old_emb + transfer_limit,
         )
         ep = self.embedding.plan_resize(emb_budget)
+        try:
+            return self._validate_plan(before, kp, ep, desired_kv)
+        except BaseException:
+            self._cancel_embedding_plan(ep)
+            raise
+
+    def _cancel_embedding_plan(self, plan):
+        cancel = getattr(self.embedding, "cancel_resize", None)
+        if callable(cancel):
+            try:
+                cancel(plan)
+            except BaseException:
+                self._state = "poisoned"
+                raise
+
+    def _validate_plan(self, before, kp, ep, desired_kv):
+        old_kv = before["kv"]["payload_bytes"]
+        old_emb = before["embedding"]["payload_bytes"]
+        growing_kv = desired_kv >= old_kv
         new_kv, new_emb = kp["payload_bytes"], ep["payload_bytes"]
         if new_kv + new_emb > self.payload_budget_bytes:
             raise ValueError("Planned native payload exceeds the shared budget")
@@ -163,79 +182,176 @@ class SharedCacheMemory:
             )
         return before, steps, peak
 
+    def transfer_quantum_bytes(self):
+        """Smallest equal KV/embedding transfer for the current VMM geometry.
+
+        KV allocates a physical chunk in every layer. For example, three
+        layers of 64 MiB and 64 MiB embedding chunks require 192 MiB moves.
+        """
+        with self._lock:
+            self._require_open()
+            state = self.stats()
+            if state["kv"].get("backend") != "gpu_only_vmm":
+                raise ValueError("Byte transfers require the whole-chunk KV VMM backend")
+            geometry = self.kv.plan_pages(self.kv.minimum_pages)
+            kv_quantum = geometry["chunk_pages"] * geometry["page_payload_bytes"]
+            tables = state["embedding"].get("tables", {})
+            chunks = {table.get("chunk_bytes") for table in tables.values()}
+            if (not tables or not all(table.get("vmm") for table in tables.values())
+                    or len(chunks) != 1):
+                raise ValueError("Byte transfers require common whole-chunk NVEmb VMM pools")
+            emb_quantum = chunks.pop()
+            if type(emb_quantum) is not int or emb_quantum <= 0:
+                raise ValueError("Invalid native embedding chunk geometry")
+            return lcm(kv_quantum, emb_quantum)
+
+    def resize_by_bytes(self, kv_delta_bytes, *, at_batch_barrier):
+        """Request a byte transfer relative to the current actual allocation.
+
+        Positive grows KV; negative grows embedding. Round toward the current
+        allocation without overshooting the requested target; transfer equal
+        amounts and preserve existing budget slack. Report any unapplied bytes
+        so callers can retain the target. Sub-quantum requests do not prepare or
+        mutate caches.
+        """
+        if at_batch_barrier is not True:
+            raise ValueError("An explicit completed-batch boundary is required")
+        if type(kv_delta_bytes) is not int:
+            raise ValueError("kv_delta_bytes must be an integer")
+        with self._lock, self.kv.resize_guard():
+            started = self._clock()
+            self._require_open()
+            if self._in_batch:
+                raise RuntimeError("Resize must run after the completed batch")
+            before = self.stats()
+            self._require_open()
+            quantum = self.transfer_quantum_bytes()
+            requested_kv = before["kv"]["payload_bytes"] + kv_delta_bytes
+            if not 0 < requested_kv < self.payload_budget_bytes:
+                raise ValueError("Byte transfer exceeds the shared payload budget")
+            actual_delta = (abs(kv_delta_bytes) // quantum) * quantum
+            if kv_delta_bytes < 0:
+                actual_delta = -actual_delta
+            request = {
+                "kv_delta_bytes": kv_delta_bytes,
+                "requested_delta_bytes": kv_delta_bytes,
+                "actual_delta_bytes": actual_delta,
+                "unapplied_delta_bytes": kv_delta_bytes - actual_delta,
+                "transfer_quantum_bytes": quantum,
+                "target_ratio": requested_kv / self.payload_budget_bytes,
+            }
+            if actual_delta == 0:
+                finished = self._clock()
+                self.last_action = {
+                    "status": "rounded_noop", **request,
+                    "reason": "zero_request" if kv_delta_bytes == 0 else "below_transfer_quantum",
+                    "before": before, "after": before, "completed": [],
+                    "action_ms": (finished - started) * 1000,
+                    "prepare_ms": (finished - started) * 1000, "apply_ms": 0.0,
+                    "embedding_resize_mode": before["embedding"].get("resize_mode", "legacy_replanned"),
+                    "peak_cache_bytes_upper_bound": before["device_pool_bytes"],
+                    "preserves_survivors": True,
+                }
+                return self.last_action
+            desired_kv = before["kv"]["payload_bytes"] + actual_delta
+            desired_emb = before["embedding"]["payload_bytes"] - actual_delta
+            if desired_emb <= 0:
+                raise ValueError("Byte transfer exceeds the available embedding donor payload")
+            kp = self.kv.plan_resize_bytes(desired_kv)
+            if kp["payload_bytes"] != desired_kv:
+                raise ValueError("KV allocation does not support the exact byte transfer")
+            ep = self.embedding.plan_resize(desired_emb)
+            try:
+                if ep["payload_bytes"] != desired_emb:
+                    raise ValueError("NVEmb allocation does not support the exact byte transfer")
+                planned = self._validate_plan(before, kp, ep, desired_kv)
+            except BaseException:
+                self._cancel_embedding_plan(ep)
+                raise
+            return self._apply_plan(
+                *planned, started=started, **request,
+            )
+
     def resize_ratio(self, ratio, *, at_batch_barrier):
         if at_batch_barrier is not True:
             raise ValueError("An explicit completed-batch boundary is required")
         with self._lock, self.kv.resize_guard():
             started = self._clock()
-            before, steps, peak = self._plan(ratio)
-            completed = []
+            return self._apply_plan(*self._plan(ratio), started=started, target_ratio=ratio)
+
+    def _apply_plan(self, before, steps, peak, *, started, **request):
+        prepared_at = self._clock()
+        ep = next(plan for name, plan, _ in steps if name == "embedding")
+        completed = []
+        try:
             for name, plan, delta in steps:
                 if not delta:
                     continue
-                # No rollback claim: after donor eviction or release, a failure
-                # must stop forwards even if the second cache never changed.
-                self._state = "poisoned"
-                try:
-                    if name == "kv":
-                        result = self.kv.resize_pages(
-                            plan["target_pages"], at_batch_barrier=True
-                        )
-                    else:
-                        kv_pool = self.kv.stats()["allocated_physical_bytes"]
-                        result = self.embedding.resize(
-                            plan,
-                            at_batch_barrier=True,
-                            device_pool_limit_bytes=self.peak_limit_bytes - kv_pool,
-                        )
-                    if result.get("preserves_survivors") is not True:
-                        raise RuntimeError(
-                            "Native resize did not acknowledge survivor preservation"
-                        )
-                    completed.append({"cache": name, "result": result})
-                except BaseException:
-                    self.last_action = {
-                        "status": "failed",
-                        "target_ratio": ratio,
-                        "completed": completed,
-                        "before": before,
-                    }
-                    raise
+                if name == "kv":
+                    result = self.kv.resize_pages(
+                        plan["target_pages"], at_batch_barrier=True
+                    )
+                else:
+                    kv_pool = self.kv.stats()["allocated_physical_bytes"]
+                    result = self.embedding.resize(
+                        plan,
+                        at_batch_barrier=True,
+                        device_pool_limit_bytes=self.peak_limit_bytes - kv_pool,
+                    )
+                if result.get("preserves_survivors") is not True:
+                    raise RuntimeError(
+                        "Native resize did not acknowledge survivor preservation"
+                    )
+                completed.append({"cache": name, "result": result})
+            # No-op plans still hold native preparation tokens; release them
+            # before allowing the next forward, including rounded ratio moves.
+            self._cancel_embedding_plan(ep)
             after = self.stats()
             expected = {name: plan["payload_bytes"] for name, plan, _ in steps}
             if any(after[name]["payload_bytes"] != expected[name] for name in expected):
-                self._state = "poisoned"
                 raise RuntimeError("Native allocation differs from the preflight plan")
             for name, plan, _ in steps:
                 field = (
                     "allocated_physical_bytes" if name == "kv" else "device_pool_bytes"
                 )
                 if after[name][field] != plan[field]:
-                    self._state = "poisoned"
-                    raise RuntimeError(
-                        "Native device pool differs from the preflight plan"
-                    )
-            if (
-                after["unused_payload_bytes"] < 0
-                or after["device_pool_bytes"] > self.peak_limit_bytes
-            ):
-                self._state = "poisoned"
+                    raise RuntimeError("Native device pool differs from the preflight plan")
+            if (after["state"] != "open" or after["unused_payload_bytes"] < 0
+                    or after["device_pool_bytes"] > self.peak_limit_bytes):
                 raise RuntimeError("Native allocation exceeded the shared envelope")
-            self._state = "open"
-            self.actions += bool(completed)
-            finished = self._clock()
-            after = self.stats()
-            self.last_action = {
-                "status": "applied" if completed else "rounded_noop",
-                "target_ratio": ratio,
-                "before": before,
-                "after": after,
-                "completed": completed,
-                "action_ms": (finished - started) * 1000,
-                "peak_cache_bytes_upper_bound": peak,
-                "preserves_survivors": True,
-            }
-            return self.last_action
+        except BaseException as error:
+            # Cancel remaining preparations before inspecting/releasing the
+            # runtime. A committed donor cannot be restored by cancellation.
+            try:
+                self._cancel_embedding_plan(ep)
+            except BaseException as cancel_error:
+                self._state = "poisoned"
+                self.last_action = {"status": "failed", **request,
+                                    "completed": completed, "before": before,
+                                    "cancel_error": str(cancel_error)}
+                raise cancel_error from error
+            unchanged = getattr(error, "receipt", {}).get("unchanged") is True
+            if completed or not unchanged or self.stats() != before:
+                self._state = "poisoned"
+            self.last_action = {"status": "rejected" if self._state == "open" else "failed",
+                                **request, "completed": completed, "before": before}
+            raise
+        self.actions += bool(completed)
+        finished = self._clock()
+        self.last_action = {
+            "status": "applied" if completed else "rounded_noop",
+            **request,
+            "before": before,
+            "after": self.stats(),
+            "completed": completed,
+            "action_ms": (finished - started) * 1000,
+            "prepare_ms": (prepared_at - started) * 1000,
+            "apply_ms": (finished - prepared_at) * 1000,
+            "embedding_resize_mode": ep.get("resize_mode", "legacy_replanned"),
+            "peak_cache_bytes_upper_bound": peak,
+            "preserves_survivors": True,
+        }
+        return self.last_action
 
     def observe(self, policy, window, *, replay_clock):
         """Consume measured native counters supplied by the replay owner.

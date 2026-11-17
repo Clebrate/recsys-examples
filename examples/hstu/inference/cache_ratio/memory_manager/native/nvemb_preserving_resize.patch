@@ -1434,7 +1434,15 @@ new file mode 100644
 diff --git a/include/gpu_table.hpp b/include/gpu_table.hpp
 --- a/include/gpu_table.hpp
 +++ b/include/gpu_table.hpp
-@@ -304,8 +304,27 @@
+@@ -28,6 +28,7 @@
+ #include <table.hpp>
+ #include <ecache/embedding_cache_combined.h>
+ #include <nve_types.hpp>
++#include <nvemb_prepared_resize.hpp>
+ 
+ namespace nve {
+ 
+@@ -304,8 +305,34 @@
     */
    virtual DataType_t get_value_type() const override;
  
@@ -1449,10 +1457,17 @@ diff --git a/include/gpu_table.hpp b/include/gpu_table.hpp
 +                                    void* counterbits_out, void* ages_out);
 +  void poison_cache_resize() noexcept { resize_poisoned_ = true; }
 +  std::string resize_cache_preserving(size_t payload_bytes, uint64_t expected_generation,
-+                                     size_t pool_limit, size_t host_limit, bool dry_run);
++                                     size_t pool_limit, size_t host_limit, bool dry_run, bool prepare = false);
++  std::string prepare_cache_resize(size_t payload_bytes, size_t host_limit);
++  std::string commit_cache_resize(const std::string& token, size_t pool_limit, size_t host_limit);
++  std::string cancel_cache_resize(const std::string& token);
 +
   private:
 -  const GPUTableConfig config_;
++  struct PreparedResize;
++  std::string apply_general_prepared(PreparedResize& prepared, size_t host_limit);
++  PreparedResizeSlot<PreparedResize> prepared_resize_;
++  mutable std::recursive_mutex resize_mutex_;
 +  GPUTableConfig config_;
 +  uint64_t resize_generation_ = 0;
 +  bool resize_poisoned_ = false;
@@ -1466,7 +1481,7 @@ diff --git a/include/gpu_table.hpp b/include/gpu_table.hpp
 diff --git a/include/hierarchical_embedding_layer.hpp b/include/hierarchical_embedding_layer.hpp
 --- a/include/hierarchical_embedding_layer.hpp
 +++ b/include/hierarchical_embedding_layer.hpp
-@@ -81,6 +81,16 @@
+@@ -81,6 +81,19 @@
    int64_t get_num_tables() const override;
  
    inline const Config& get_config() const { return config_; }
@@ -1478,6 +1493,9 @@ diff --git a/include/hierarchical_embedding_layer.hpp b/include/hierarchical_emb
 +  std::string cache_resize_metadata(uint64_t expected_sets, void* tags_out,
 +                                    void* counterbits_out, void* ages_out);
 +  void poison_cache_resize();
++  std::string prepare_cache_resize(size_t payload_bytes, size_t host_limit);
++  std::string commit_cache_resize(const std::string& token, size_t pool_limit, size_t host_limit);
++  std::string cancel_cache_resize(const std::string& token);
 +  std::string resize_cache_preserving(size_t payload_bytes, uint64_t generation,
 +                                     size_t pool_limit, size_t host_limit, bool dry_run);
  
@@ -1600,6 +1618,59 @@ new file mode 100644
 +  }
 +  return plan;
 +}
++}  // namespace nve
+diff --git a/include/nvemb_prepared_resize.hpp b/include/nvemb_prepared_resize.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/nvemb_prepared_resize.hpp
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++#include <string>
++
++namespace nve {
++// Process-wide tokens prevent a token from one table authorizing another table.
++inline uint64_t next_prepared_resize_token() {
++  static std::atomic<uint64_t> serial{0};
++  auto value = serial.load(std::memory_order_relaxed);
++  do {
++    if (value == std::numeric_limits<uint64_t>::max())
++      throw std::overflow_error("prepared_resize_token_exhausted");
++  } while (!serial.compare_exchange_weak(value, value + 1, std::memory_order_relaxed));
++  return value + 1;
++}
++
++// The owner serializes this slot with context creation and resize operations.
++// Failed authentication never consumes another caller's pending transaction.
++template<class Plan> class PreparedResizeSlot {
++ public:
++  bool pending() const noexcept { return bool(plan_); }
++  std::string token() const { return pending() ? std::to_string(token_) : std::string{}; }
++  uint64_t generation() const noexcept { return generation_; }
++  bool matches(const std::string& token) const { return pending() && token == this->token(); }
++  Plan& get() { if (!pending()) throw std::invalid_argument("no_prepared_resize"); return *plan_; }
++  const Plan& get() const { if (!pending()) throw std::invalid_argument("no_prepared_resize"); return *plan_; }
++  std::string prepare(std::unique_ptr<Plan> plan, uint64_t generation) {
++    if (pending()) throw std::invalid_argument("resize_already_prepared");
++    if (!plan) throw std::invalid_argument("null_prepared_plan");
++    const auto token = next_prepared_resize_token();
++    plan_ = std::move(plan); generation_ = generation; token_ = token;
++    return this->token();
++  }
++  std::unique_ptr<Plan> consume(const std::string& token, uint64_t generation) {
++    if (!matches(token)) throw std::invalid_argument("invalid_prepared_token");
++    if (generation != generation_) throw std::invalid_argument("stale_generation");
++    return std::move(plan_);
++  }
++ private:
++  std::unique_ptr<Plan> plan_;
++  uint64_t token_ = 0, generation_ = 0;
++};
 +}  // namespace nve
 diff --git a/include/nvemb_rehash.hpp b/include/nvemb_rehash.hpp
 new file mode 100644
@@ -1735,15 +1806,16 @@ new file mode 100644
 diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/binding_layers.hpp
 --- a/python/pynve/bindings/binding_layers.hpp
 +++ b/python/pynve/bindings/binding_layers.hpp
-@@ -30,6 +30,7 @@
+@@ -30,6 +30,8 @@
  #include "include/insert_heuristic.hpp"
  #include <iostream>
  #include <fstream>
 +#include <chrono>
++#include <exception>
  #include "third_party/dlpack/include/dlpack/dlpack.h"
  #include "include/resizeable_buffer.hpp"
  #include "include/allocator.hpp"
-@@ -45,6 +46,7 @@
+@@ -45,6 +47,7 @@
  
  #include <sys/mman.h>
  #include <mutex>
@@ -1751,7 +1823,87 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
  
  namespace nve {
  
-@@ -321,16 +323,39 @@
+@@ -69,6 +72,8 @@
+ 
+     void lookup(size_t num_keys, uintptr_t keys, uintptr_t output, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         float hitrates[3] = {0};
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         
+@@ -88,6 +93,8 @@
+                              uint32_t pooling_type, size_t num_offsets, uintptr_t offsets,
+                              uint64_t weight_data_type, uintptr_t weights, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         float hitrates[3] = {0};
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         
+@@ -115,6 +122,8 @@
+     size_t concat_backprop(size_t num_keys, uintptr_t keys, uintptr_t grads,
+                            uint64_t unique_keys, uintptr_t output_grads, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         NVE_CHECK_(device_id_ >= 0,
+                    "concat_backprop is not supported on a host-only layer (device_id < 0). "
+                    "Gradient computation requires a CUDA device; HostLayer is inference-only.");
+@@ -177,6 +186,8 @@
+                             uint32_t pooling_type, uint32_t num_offsets, uintptr_t offsets,
+                             uint64_t /*data_type*/, uintptr_t weights, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         NVE_CHECK_(device_id_ >= 0,
+                    "pooling_backprop is not supported on a host-only layer (device_id < 0). "
+                    "Gradient computation requires a CUDA device; HostLayer is inference-only.");
+@@ -236,6 +247,8 @@
+ 
+     void accumulate(size_t num_keys, uintptr_t keys, uintptr_t updates, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         emb_layer_ptr_->accumulate(ctx, num_keys, 
+                             reinterpret_cast<const void*>(keys),
+@@ -248,6 +261,8 @@
+ 
+     void update(size_t num_keys, uintptr_t keys, uintptr_t updates, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         emb_layer_ptr_->update(ctx, num_keys, 
+                             reinterpret_cast<const void*>(keys),
+@@ -259,6 +274,8 @@
+ 
+     void insert(size_t num_keys, uintptr_t keys, uintptr_t values, int64_t table_id, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         emb_layer_ptr_->insert( ctx,
+                                 num_keys,
+@@ -271,12 +288,16 @@
+ 
+     void clear(uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         emb_layer_ptr_->clear(ctx);
+     }
+ 
+     void erase(size_t num_keys, uintptr_t keys, int64_t table_id, uint64_t stream_)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(cache_access_mutex_);
++        NVE_CHECK_(!contexts_prepared_ && !contexts_poisoned_, "Cache resize blocks data operations");
+         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
+         emb_layer_ptr_->erase(ctx, num_keys, reinterpret_cast<const void*>(keys), table_id);
+     }
+@@ -321,16 +342,39 @@
      }
  
  protected:
@@ -1793,23 +1945,55 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
      }
  
      std::shared_ptr<nve::ExecutionContext> get_exec_context(cudaStream_t stream)
-@@ -338,6 +363,7 @@
+@@ -338,6 +382,8 @@
          // we will be using one modify stream across the layer ctx, I assume for inference this is enough.
          // for training we probably want to use private stream to optimize accumulates
          std::lock_guard lock(stream_ctx_map_mutex_);
 +        NVE_CHECK_(!contexts_poisoned_, "Cache resize failed; recreate the runtime before use");
++        NVE_CHECK_(!contexts_prepared_, "Cache resize is prepared; commit or cancel before use");
          if (stream_ctx_map_.count(stream) != 1)
          {
              // For host-only layers (device_id_ < 0) we need to set the default stream.
-@@ -383,6 +409,7 @@
+@@ -383,6 +429,9 @@
      nve::DataType_t data_type_ = nve::DataType_t::Unknown;
      size_t max_num_keys_ = 0;
      std::map<cudaStream_t, std::shared_ptr<nve::ExecutionContext>> stream_ctx_map_;
 +    bool contexts_poisoned_ = false;
++    bool contexts_prepared_ = false;
++    mutable std::recursive_mutex cache_access_mutex_;
      cudaStream_t modify_stream_ = 0;
      int device_id_ = -1;
      int64_t logging_counter_ = 0;
-@@ -452,12 +479,137 @@
+@@ -395,6 +444,28 @@
+ {
+ private:
+     using layer_type = nve::HierarchicalEmbeddingLayer<IndexT>;
++    std::mutex prepared_resize_mutex_;
++    std::vector<cudaStream_t> prepared_streams_;
++    static double prepared_elapsed_ms(std::chrono::steady_clock::time_point start) {
++        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++    }
++    double resume_prepared_contexts(const std::shared_ptr<layer_type>& layer) {
++        const auto state = nlohmann::json::parse(layer->cache_resize_state());
++        if (state.value("state", "poisoned") != "ready") {
++            this->contexts_poisoned_ = true;
++            return 0.0;
++        }
++        if (state.value("prepared", false)) return 0.0;
++        const auto start = std::chrono::steady_clock::now();
++        {
++            std::lock_guard lock(this->stream_ctx_map_mutex_);
++            this->contexts_prepared_ = false;
++        }
++        try { this->rebuild_contexts(prepared_streams_); }
++        catch (...) { this->contexts_poisoned_ = true; layer->poison_cache_resize(); throw; }
++        prepared_streams_.clear();
++        return prepared_elapsed_ms(start);
++    }
+ 
+ public:
+     HierarchicalEmbedding(size_t row_size, nve::DataType_t dtype,
+@@ -452,6 +523,7 @@
          if (remote) {
              // we are using a custom table wrapper to be able to do late binding of the parameter server
              ps_table_ = std::make_shared<PyNVETable>(remote);
@@ -1817,21 +2001,23 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
              tables.push_back(ps_table_);
              insert_heuristic_thresholds.push_back(0.f); // remote PS is typically updated externally instead of by the layer
          }
-         typename layer_type::Config layer_cfg = {"ps_layer", std::make_shared<DefaultInsertHeuristic>(insert_heuristic_thresholds)};
-         layer_cfg.default_embedding = config.default_embedding;
+@@ -460,8 +532,236 @@
          this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, tables, nullptr /* using default allocator for device 0*/);
-+    }
-+
+     }
+ 
 +    // All calls require the owner's exclusive completed-batch barrier. Python
 +    // callers must exclude lookup/update/insert/erase and CUDA graph execution.
 +    std::string cache_resize_capabilities() const
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
 +        const auto state = nlohmann::json::parse(layer->cache_resize_state());
 +        const bool vmm = state.value("vmm", false);
 +        return nlohmann::json({{"version", 1},
 +            {"mode", state.value("per_row_ages", false) ? "native_nvemb_vmm_general_row_ages" :
 +                (vmm ? "native_nvemb_vmm_original_policy" : "raw_rehash_cpu_staging")},
++            {"prepared_resize", vmm && state.value("per_row_ages", false)},
++            {"prepared_resize_version", 1},
 +            {"per_row_ages", state.value("per_row_ages", false)},
 +            {"arbitrary_set_geometry", state.value("per_row_ages", false)},
 +            {"preserves_values", true}, {"preserves_counter_bits", true},
@@ -1839,11 +2025,13 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +    }
 +    std::string cache_resize_state() const
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
 +        return layer->cache_resize_state();
 +    }
 +    std::string cache_resize_occupancy()
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
 +        ScopedDevice device(this->device_id_);
 +        this->wait_contexts();
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
@@ -1851,6 +2039,8 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +    }
 +    std::string cache_policy_observation(bool reset = true)
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        NVE_CHECK_(!this->contexts_prepared_, "Policy observation is blocked during prepared resize");
 +        ScopedDevice device(this->device_id_);
 +        this->wait_contexts();
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
@@ -1862,6 +2052,7 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +    std::string cache_resize_row_metadata(uint64_t expected_sets, uintptr_t tags_out,
 +                                          uintptr_t counterbits_out, uintptr_t row_ages_out)
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
 +        ScopedDevice device(this->device_id_);
 +        this->wait_contexts();
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
@@ -1870,6 +2061,8 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +    }
 +    std::string plan_cache_resize(size_t payload_bytes, size_t host_limit)
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        std::lock_guard<std::mutex> resize_lock(prepared_resize_mutex_);
 +        ScopedDevice device(this->device_id_);
 +        this->wait_contexts();
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
@@ -1893,6 +2086,7 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +    std::string cache_resize_metadata(uint64_t expected_sets, uintptr_t tags_out,
 +                                      uintptr_t counterbits_out, uintptr_t ages_out)
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
 +        ScopedDevice device(this->device_id_);
 +        this->wait_contexts();
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
@@ -1902,9 +2096,14 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +    std::string apply_cache_resize(size_t payload_bytes, uint64_t generation,
 +                                  size_t pool_limit, size_t host_limit)
 +    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        std::lock_guard<std::mutex> resize_lock(prepared_resize_mutex_);
 +        ScopedDevice device(this->device_id_);
 +        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
 +        const auto before = nlohmann::json::parse(layer->cache_resize_state());
++        if (before.value("prepared", false))
++            return nlohmann::json({{"status", "rejected"}, {"reason", "resize_already_prepared"},
++                {"before", before}, {"after", before}}).dump();
 +        if (!before.value("vmm", false)) {
 +            this->release_contexts();
 +            return layer->resize_cache_preserving(payload_bytes, generation, pool_limit, host_limit, false);
@@ -1944,9 +2143,101 @@ diff --git a/python/pynve/bindings/binding_layers.hpp b/python/pynve/bindings/bi
 +        receipt["context_count"] = streams.size();
 +        receipt["contexts_rebuilt_before_return"] = true;
 +        return receipt.dump();
++    }
++
++    std::string prepare_cache_resize(size_t payload_bytes, size_t host_limit)
++    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        std::lock_guard<std::mutex> resize_lock(prepared_resize_mutex_);
++        ScopedDevice device(this->device_id_);
++        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
++        const auto before = nlohmann::json::parse(layer->cache_resize_state());
++        if (before.value("prepared", false))
++            return nlohmann::json({{"status", "rejected"}, {"reason", "resize_already_prepared"},
++                {"before", before}, {"after", before}}).dump();
++        {
++            std::lock_guard lock(this->stream_ctx_map_mutex_);
++            NVE_CHECK_(!this->contexts_poisoned_, "Cache resize failed; recreate the runtime before use");
++            prepared_streams_.clear();
++            for (const auto& entry : this->stream_ctx_map_)
++                if (entry.second) prepared_streams_.push_back(entry.first);
++            this->contexts_prepared_ = true;
++        }
++        const size_t context_count = prepared_streams_.size();
++        const auto drain_start = std::chrono::steady_clock::now();
++        try { this->release_contexts(); }
++        catch (...) { this->contexts_poisoned_ = true; layer->poison_cache_resize(); throw; }
++        const double drain_ms = prepared_elapsed_ms(drain_start);
++        const auto native_start = std::chrono::steady_clock::now();
++        try {
++            auto receipt = nlohmann::json::parse(layer->prepare_cache_resize(payload_bytes, host_limit));
++            receipt["native_prepare_ms"] = prepared_elapsed_ms(native_start);
++            receipt["context_drain_ms"] = drain_ms;
++            receipt["context_count"] = context_count;
++            receipt["context_rebuild_ms"] = resume_prepared_contexts(layer);
++            receipt["contexts_rebuilt_before_return"] = receipt.value("status", "") != "prepared";
++            return receipt.dump();
++        } catch (...) {
++            const auto original = std::current_exception();
++            try {
++                auto state = nlohmann::json::parse(layer->cache_resize_state());
++                if (state.value("prepared", false) && state.value("state", "poisoned") == "ready")
++                    layer->cancel_cache_resize(state.at("prepared_token").template get<std::string>());
++                resume_prepared_contexts(layer);
++            } catch (...) { this->contexts_poisoned_ = true; layer->poison_cache_resize(); }
++            std::rethrow_exception(original);
++        }
++    }
++    std::string commit_cache_resize(const std::string& token, size_t pool_limit, size_t host_limit)
++    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        std::lock_guard<std::mutex> resize_lock(prepared_resize_mutex_);
++        ScopedDevice device(this->device_id_);
++        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
++        const size_t context_count = prepared_streams_.size();
++        const auto native_start = std::chrono::steady_clock::now();
++        try {
++            auto receipt = nlohmann::json::parse(layer->commit_cache_resize(token, pool_limit, host_limit));
++            receipt["native_resize_ms"] = prepared_elapsed_ms(native_start);
++            receipt["context_drain_ms"] = 0.0;  // Already charged to prepare.
++            receipt["context_count"] = context_count;
++            receipt["context_rebuild_ms"] = resume_prepared_contexts(layer);
++            const auto state = nlohmann::json::parse(layer->cache_resize_state());
++            receipt["contexts_rebuilt_before_return"] = !state.value("prepared", false) &&
++                state.value("state", "poisoned") == "ready";
++            return receipt.dump();
++        } catch (...) {
++            const auto original = std::current_exception();
++            try { resume_prepared_contexts(layer); }
++            catch (...) { this->contexts_poisoned_ = true; layer->poison_cache_resize(); }
++            std::rethrow_exception(original);
++        }
++    }
++    std::string cancel_cache_resize(const std::string& token)
++    {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        std::lock_guard<std::mutex> resize_lock(prepared_resize_mutex_);
++        ScopedDevice device(this->device_id_);
++        auto layer = std::dynamic_pointer_cast<layer_type>(this->emb_layer_ptr_);
++        try {
++            auto receipt = nlohmann::json::parse(layer->cancel_cache_resize(token));
++            receipt["context_rebuild_ms"] = resume_prepared_contexts(layer);
++            return receipt.dump();
++        } catch (...) {
++            const auto original = std::current_exception();
++            try { resume_prepared_contexts(layer); }
++            catch (...) { this->contexts_poisoned_ = true; layer->poison_cache_resize(); }
++            std::rethrow_exception(original);
++        }
++    }
++
+     void set_ps_table(std::shared_ptr<nve::Table>& table)
+     {
++        std::lock_guard<std::recursive_mutex> access_lock(this->cache_access_mutex_);
++        NVE_CHECK_(!this->contexts_prepared_ && !this->contexts_poisoned_, "Cache resize blocks PS replacement");
+         ps_table_->set_table(table);
      }
  
-     void set_ps_table(std::shared_ptr<nve::Table>& table)
 diff --git a/python/pynve/bindings/binding_tables.hpp b/python/pynve/bindings/binding_tables.hpp
 --- a/python/pynve/bindings/binding_tables.hpp
 +++ b/python/pynve/bindings/binding_tables.hpp
@@ -2084,7 +2375,7 @@ diff --git a/python/pynve/bindings/binding_tables.hpp b/python/pynve/bindings/bi
 diff --git a/python/pynve/bindings/python_binding.cu b/python/pynve/bindings/python_binding.cu
 --- a/python/pynve/bindings/python_binding.cu
 +++ b/python/pynve/bindings/python_binding.cu
-@@ -163,7 +163,15 @@
+@@ -163,7 +163,18 @@
  
      py::class_<HierarchicalEmbedding<IndexT>, NVEmbedBinding<IndexT>, std::shared_ptr<HierarchicalEmbedding<IndexT>>> (m, "HierarchicalEmbedding")
          .def(py::init<size_t, nve::DataType_t, uint64_t, uint64_t, table_ptr_t, uint64_t, bool, int, EmbedLayerConfig>())
@@ -2097,7 +2388,10 @@ diff --git a/python/pynve/bindings/python_binding.cu b/python/pynve/bindings/pyt
 +        .def("cache_resize_row_metadata", &HierarchicalEmbedding<IndexT>::cache_resize_row_metadata, py::call_guard<py::gil_scoped_release>())
 +        .def("cache_resize_metadata", &HierarchicalEmbedding<IndexT>::cache_resize_metadata, py::call_guard<py::gil_scoped_release>())
 +        .def("plan_cache_resize", &HierarchicalEmbedding<IndexT>::plan_cache_resize, py::call_guard<py::gil_scoped_release>())
-+        .def("apply_cache_resize", &HierarchicalEmbedding<IndexT>::apply_cache_resize, py::call_guard<py::gil_scoped_release>());
++        .def("apply_cache_resize", &HierarchicalEmbedding<IndexT>::apply_cache_resize, py::call_guard<py::gil_scoped_release>())
++        .def("prepare_cache_resize", &HierarchicalEmbedding<IndexT>::prepare_cache_resize, py::call_guard<py::gil_scoped_release>())
++        .def("commit_cache_resize", &HierarchicalEmbedding<IndexT>::commit_cache_resize, py::call_guard<py::gil_scoped_release>())
++        .def("cancel_cache_resize", &HierarchicalEmbedding<IndexT>::cancel_cache_resize, py::call_guard<py::gil_scoped_release>());
  
      py::class_<LinearUVMEmbedding<IndexT>, NVEmbedBinding<IndexT>, std::shared_ptr<LinearUVMEmbedding<IndexT>>> (m, "LinearUVMEmbedding")
          .def(py::init<size_t, size_t, nve::DataType_t, std::shared_ptr<MemBlock>, size_t, bool, int, EmbedLayerConfig>())
@@ -2188,18 +2482,32 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
    if (config.modify_on_gpu) {
      cache_ = std::make_shared<CacheTypeDevice>(allocator_.get(), GetGlobalLogger(), cfg);
    } else {
-@@ -229,6 +292,345 @@
+@@ -227,12 +290,481 @@
+ }
+ 
  template <typename KeyType>
- GpuTable<KeyType>::~GpuTable() {
-   NVE_CHECK_(contexts_->empty(), "GPUTable destroyed with existing execution contexts");
-+}
++struct GpuTable<KeyType>::PreparedResize {
++  using Raw = typename nve::CacheSADeviceModify<KeyType, KeyType>::RawState;
++  GeneralRehashPlan<Raw> plan;
++  nlohmann::json receipt;
++  size_t before_sets = 0, sets = 0, per_set = 0, target_pool = 0, host_bound = 0;
++  bool unchanged = false;
++};
 +
 +template <typename KeyType>
+ GpuTable<KeyType>::~GpuTable() {
+   NVE_CHECK_(contexts_->empty(), "GPUTable destroyed with existing execution contexts");
+ }
+ 
+ template <typename KeyType>
 +std::string GpuTable<KeyType>::cache_resize_state() const {
++  std::lock_guard<std::recursive_mutex> lock(resize_mutex_);
 +  nlohmann::json result = {{"generation", resize_generation_},
 +                          {"configured_bytes", config_.cache_size},
 +                          {"vmm", bool(vmm_storage_)},
-+                          {"state", resize_poisoned_ ? "poisoned" : "ready"}};
++                          {"state", resize_poisoned_ ? "poisoned" : "ready"},
++                          {"prepared", prepared_resize_.pending()}};
++  if (prepared_resize_.pending()) result["prepared_token"] = prepared_resize_.token();
 +  if (resize_poisoned_ || !cache_ || (vmm_storage_ && vmm_storage_->poisoned())) {
 +    result["state"] = "poisoned";
 +    result["payload_bytes"] = nullptr;
@@ -2330,7 +2638,8 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +
 +template <typename KeyType>
 +std::string GpuTable<KeyType>::resize_cache_preserving(
-+    size_t payload_bytes, uint64_t generation, size_t pool_limit, size_t host_limit, bool dry_run) {
++    size_t payload_bytes, uint64_t generation, size_t pool_limit, size_t host_limit, bool dry_run, bool prepare) {
++  std::lock_guard<std::recursive_mutex> lock(resize_mutex_);
 +  if constexpr (!std::is_same_v<KeyType, int64_t>) {
 +    throw std::invalid_argument("Preserving resize supports int64 keys only");
 +  } else {
@@ -2348,8 +2657,10 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    return receipt.dump();
 +  };
 +  if (resize_poisoned_ || !cache_) return reject("poisoned");
++  if (prepared_resize_.pending()) return reject("resize_already_prepared");
++  if (prepare && (!vmm_storage_ || !vmm_general_rehash_)) return reject("prepared_resize_requires_general_vmm");
 +  if (generation != resize_generation_) return reject("stale_generation");
-+  if (!dry_run && !contexts_->empty()) return reject("execution_contexts_are_still_live");
++  if ((!dry_run || prepare) && !contexts_->empty()) return reject("execution_contexts_are_still_live");
 +  auto source = std::dynamic_pointer_cast<DeviceCache>(cache_);
 +  const size_t row = static_cast<size_t>(config_.row_size_in_bytes);
 +  constexpr size_t ways = DeviceCache::NUM_WAYS;
@@ -2378,6 +2689,20 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    receipt["after"] = before;
 +    receipt["survivor_rows"] = nullptr;
 +    receipt["evicted_rows"] = 0;
++    if (prepare) {
++      if (sizeof(PreparedResize) > host_limit) return reject("host_staging_budget");
++      auto pending = std::make_unique<PreparedResize>();
++      pending->receipt = receipt; pending->unchanged = true;
++      pending->target_pool = target_pool; pending->sets = pending->before_sets = sets;
++      pending->host_bound = sizeof(PreparedResize);
++      receipt["status"] = "prepared";
++      receipt["token"] = prepared_resize_.prepare(std::move(pending), resize_generation_);
++      receipt["prepared_host_bytes"] = sizeof(PreparedResize);
++      receipt["prepared_host_scope"] = "retained_staging_vector_capacities_and_plan_object";
++      receipt["host_staging_peak_bound_bytes"] = sizeof(PreparedResize);
++      receipt["commit_host_staging_peak_bound_bytes"] = sizeof(PreparedResize);
++      receipt["after"] = nlohmann::json::parse(cache_resize_state());
++    }
 +    return receipt.dump();
 +  }
 +  if (vmm_storage_ && vmm_general_rehash_) {
@@ -2391,6 +2716,10 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +      plan = plan_general_rehash(old, sets, host_limit);
 +    }
 +    catch (const std::invalid_argument& error) { return reject(error.what()); }
++    catch (const std::bad_alloc&) {
++      if (prepare) return reject("host_allocation_failed");
++      resize_poisoned_ = true; throw;
++    }
 +    catch (...) { resize_poisoned_ = true; throw; }
 +    receipt["native_preflight_ms"] = nvemb_elapsed_ms(preflight_start);
 +    receipt["physical_mode"] = "vmm_native_general_row_ages_cpu_staging";
@@ -2399,29 +2728,29 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +    receipt["evicted_rows"] = plan.evicted_keys.size();
 +    receipt["host_staging_peak_bound_bytes"] = plan.host_peak_bound;
 +    receipt["status"] = "planned";
-+    if (dry_run) return receipt.dump();
-+    old = Raw{};
-+    resize_poisoned_ = true;
-+    double mapping_ms = 0;
-+    if (sets > before_sets) {
-+      const auto start = std::chrono::steady_clock::now();
-+      vmm_storage_->resize_values(sets * ways * row);
-+      mapping_ms += nvemb_elapsed_ms(start);
++    if (dry_run && !prepare) return receipt.dump();
++    old = Raw{};  // The retained transaction owns only the target, not a second old payload.
++    auto pending = std::make_unique<PreparedResize>();
++    pending->plan = std::move(plan); pending->receipt = receipt;
++    pending->before_sets = before_sets; pending->sets = sets;
++    pending->per_set = per_set; pending->target_pool = target_pool; pending->host_bound = host_bound;
++    if (prepare) {
++      const auto& target = pending->plan.target;
++      // Vector capacities are the retained staging allocations; receipt JSON and
++      // allocator bookkeeping are outside the existing staging-budget scope.
++      const size_t retained = sizeof(PreparedResize) + target.data.capacity() +
++          8 * (target.tags.capacity() + target.set_timestamps.capacity() + target.row_timestamps.capacity() +
++               pending->plan.evicted_keys.capacity()) +
++          4 * (target.counters.capacity() + target.effective_scores.capacity());
++      receipt["prepared_host_bytes"] = retained;
++      receipt["commit_host_staging_peak_bound_bytes"] = host_bound;
++      receipt["prepared_host_scope"] = "retained_staging_vector_capacities_and_plan_object";
++      receipt["status"] = "prepared";
++      receipt["token"] = prepared_resize_.prepare(std::move(pending), resize_generation_);
++      receipt["after"] = nlohmann::json::parse(cache_resize_state());
++      return receipt.dump();
 +    }
-+    const auto rewrite_start = std::chrono::steady_clock::now();
-+    source->apply_general_state(plan.target, true, host_limit);
-+    if (policy_observation_) policy_observation_->append_capacity(plan.evicted_keys, plan.target.global_ts);
-+    receipt["native_rehash_ms"] = nvemb_elapsed_ms(rewrite_start);
-+    if (sets < before_sets) {
-+      const auto start = std::chrono::steady_clock::now();
-+      vmm_storage_->resize_values(sets * ways * row);
-+      mapping_ms += nvemb_elapsed_ms(start);
-+    }
-+    receipt["vmm_mapping_ms"] = mapping_ms;
-+    config_.cache_size = sets * per_set;
-+    ++resize_generation_; resize_poisoned_ = false;
-+    receipt["status"] = "applied"; receipt["after"] = nlohmann::json::parse(cache_resize_state());
-+    return receipt.dump();
++    return apply_general_prepared(*pending, host_limit);
 +  }
 +  if (vmm_storage_ && vmm_fast_rehash_) {
 +    if (!(sets == 2 * before_sets || before_sets == 2 * sets))
@@ -2531,21 +2860,188 @@ diff --git a/src/gpu_table.cu b/src/gpu_table.cu
 +  receipt["after"] = nlohmann::json::parse(cache_resize_state());
 +  return receipt.dump();
 +  }
- }
++}
++
++template <typename KeyType>
++std::string GpuTable<KeyType>::apply_general_prepared(PreparedResize& prepared, size_t host_limit) {
++  if constexpr (!std::is_same_v<KeyType, int64_t>) {
++    throw std::invalid_argument("Preserving resize supports int64 keys only");
++  } else {
++    auto receipt = prepared.receipt;
++    if (prepared.unchanged) {
++      receipt["status"] = "unchanged";
++      receipt["after"] = nlohmann::json::parse(cache_resize_state());
++      return receipt.dump();
++    }
++    using DeviceCache = nve::CacheSADeviceModify<KeyType, KeyType>;
++    auto source = std::dynamic_pointer_cast<DeviceCache>(cache_);
++    auto& plan = prepared.plan;
++    // From the first mapping/write onward all failures are irreversible. Keep
++    // the existing full restore/readback validation and never resume on failure.
++    resize_poisoned_ = true;
++    double mapping_ms = 0;
++    if (prepared.sets > prepared.before_sets) {
++      const auto start = std::chrono::steady_clock::now();
++      vmm_storage_->resize_values(plan.target.data.size());
++      mapping_ms += nvemb_elapsed_ms(start);
++    }
++    const auto rewrite_start = std::chrono::steady_clock::now();
++    source->apply_general_state(plan.target, true, host_limit);
++    if (policy_observation_) policy_observation_->append_capacity(plan.evicted_keys, plan.target.global_ts);
++    receipt["native_rehash_ms"] = nvemb_elapsed_ms(rewrite_start);
++    if (prepared.sets < prepared.before_sets) {
++      const auto start = std::chrono::steady_clock::now();
++      vmm_storage_->resize_values(plan.target.data.size());
++      mapping_ms += nvemb_elapsed_ms(start);
++    }
++    receipt["vmm_mapping_ms"] = mapping_ms;
++    config_.cache_size = prepared.sets * prepared.per_set;
++    ++resize_generation_; resize_poisoned_ = false;
++    receipt["status"] = "applied";
++    receipt["after"] = nlohmann::json::parse(cache_resize_state());
++    return receipt.dump();
++  }
++}
++
++template <typename KeyType>
++std::string GpuTable<KeyType>::prepare_cache_resize(size_t payload_bytes, size_t host_limit) {
++  std::lock_guard<std::recursive_mutex> lock(resize_mutex_);
++  return resize_cache_preserving(payload_bytes, resize_generation_,
++      std::numeric_limits<size_t>::max(), host_limit, true, true);
++}
++
++template <typename KeyType>
++std::string GpuTable<KeyType>::commit_cache_resize(const std::string& token,
++                                                  size_t pool_limit, size_t host_limit) {
++  std::lock_guard<std::recursive_mutex> lock(resize_mutex_);
++  auto before = nlohmann::json::parse(cache_resize_state());
++  if (!prepared_resize_.matches(token))
++    return nlohmann::json({{"status", "rejected"}, {"reason", "invalid_prepared_token"},
++        {"token_consumed", false}, {"before", before}, {"after", before}}).dump();
++  ScopedDevice scope(config_.device_id);
++  if (vmm_storage_) vmm_storage_->validate_context();
++  const auto generation = prepared_resize_.generation();
++  auto pending = prepared_resize_.consume(token, generation);
++  auto reject = [&](const char* reason) {
++    auto receipt = pending->receipt;
++    receipt["status"] = "rejected"; receipt["reason"] = reason;
++    receipt["token"] = token; receipt["token_consumed"] = true;
++    receipt["after"] = nlohmann::json::parse(cache_resize_state());
++    return receipt.dump();
++  };
++  if (resize_poisoned_ || !cache_ || vmm_storage_->poisoned()) return reject("poisoned");
++  if (generation != resize_generation_) return reject("stale_generation");
++  if (!contexts_->empty()) return reject("execution_contexts_are_still_live");
++  if (pending->target_pool > pool_limit) return reject("device_pool_budget");
++  if (pending->host_bound > host_limit) return reject("host_staging_budget");
++  if (!pending->unchanged && resize_generation_ == std::numeric_limits<uint64_t>::max())
++    return reject("generation_exhausted");
++  pending->receipt["prepared_preflight_ms"] = pending->receipt.value("native_preflight_ms", 0.0);
++  pending->receipt["native_preflight_ms"] = 0.0;  // No second export or planning pass.
++  pending->receipt["plan_reused"] = true;
++  pending->receipt["token"] = token; pending->receipt["token_consumed"] = true;
++  return apply_general_prepared(*pending, host_limit);
++}
++
++template <typename KeyType>
++std::string GpuTable<KeyType>::cancel_cache_resize(const std::string& token) {
++  std::lock_guard<std::recursive_mutex> lock(resize_mutex_);
++  const auto before = nlohmann::json::parse(cache_resize_state());
++  if (!prepared_resize_.matches(token))
++    return nlohmann::json({{"status", "rejected"}, {"reason", "invalid_prepared_token"},
++        {"token_consumed", false}, {"before", before}, {"after", before}}).dump();
++  ScopedDevice scope(config_.device_id);
++  if (vmm_storage_) vmm_storage_->validate_context();
++  auto pending = prepared_resize_.consume(token, prepared_resize_.generation());
++  pending.reset();  // Release retained staging before returning/rebuilding contexts.
++  return nlohmann::json({{"status", "cancelled"}, {"token", token}, {"token_consumed", true},
++      {"before", before}, {"after", nlohmann::json::parse(cache_resize_state())}}).dump();
++}
++
++template <typename KeyType>
+ void GpuTable<KeyType>::clear(context_ptr_t& ctx) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL5_();
+   ScopedDevice scope_device(config_.device_id);
+   auto gpu_table_ctx = std::dynamic_pointer_cast<GPUTableExecutionContext<KeyType>>(ctx);
+@@ -243,6 +775,7 @@
  
  template <typename KeyType>
-@@ -1121,6 +1523,7 @@
+ void GpuTable<KeyType>::erase(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL6_();
+   ScopedDevice scope_device(config_.device_id);
+   auto modify_stream = ctx->get_modify_stream();
+@@ -380,6 +913,7 @@
+   NVE_CHECK_(value_sizes == nullptr, "value_sizes must be nullptr for GPU table");
+   auto lookup_stream = ctx->get_lookup_stream();
+   if (num_keys <= 0) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+     return;
+   }
+   NVE_CHECK_ARG_(keys != nullptr, "keys must not be null");
+@@ -415,6 +949,7 @@
+ template <typename KeyType>
+ void GpuTable<KeyType>::insert(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys,
+                                int64_t value_stride, int64_t value_size, buffer_ptr<const void> values) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL2_();
+   ScopedDevice scope_device(config_.device_id);  
+   auto modify_stream = ctx->get_modify_stream();
+@@ -492,6 +1027,7 @@
+ 
+ template <typename KeyType>
+ void GpuTable<KeyType>::insert_from_uvm(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL2_();
+   ScopedDevice scope_device(config_.device_id);
+   NVE_CHECK_(config_.uvm_table != nullptr, "insert_from_uvm requires a UVM table");
+@@ -578,6 +1114,7 @@
+ template <typename KeyType>
+ void GpuTable<KeyType>::update(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys,
+                                int64_t update_stride, int64_t update_size, buffer_ptr<const void> updates) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL3_();
+   ScopedDevice scope_device(config_.device_id);
+   auto modify_stream = ctx->get_modify_stream();
+@@ -683,6 +1220,7 @@
+ void GpuTable<KeyType>::update_accumulate(context_ptr_t& ctx, int64_t num_keys, buffer_ptr<const void> keys,
+                                           int64_t update_stride, int64_t update_size,
+                                           buffer_ptr<const void> updates, DataType_t update_dtype) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL4_();
+   ScopedDevice scope_device(config_.device_id);
+   if (num_keys <= 0) {
+@@ -1052,6 +1590,7 @@
+     int64_t fixed_hotness, PoolingType_t pooling_type, buffer_ptr<const void> weights_bw,
+     DataType_t output_dtype, DataType_t weight_dtype,
+     int64_t value_stride, buffer_ptr<void> values_bw) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   NVE_NVTX_SCOPED_FUNCTION_COL1_();
+   ScopedDevice scope_device(config_.device_id);
+   if (num_keys <= 0) {
+@@ -1121,6 +1660,9 @@
      thread_pool_ptr_t thread_pool,
      allocator_ptr_t allocator) 
  {
++  std::lock_guard<std::recursive_mutex> lock(resize_mutex_);
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
 +  NVE_CHECK_(!resize_poisoned_ && cache_, "Cache resize failed; recreate the runtime before use");
    ScopedDevice scoped_device(config_.device_id);
    if (config_.private_stream &&
        ((config_.private_stream != lookup_stream) || (config_.private_stream != modify_stream))) {
+@@ -1139,6 +1681,7 @@
+ 
+ template <typename KeyType>
+ void GpuTable<KeyType>::reset_lookup_counter(context_ptr_t& ctx) {
++  NVE_CHECK_(!prepared_resize_.pending(), "Cache resize is prepared; commit or cancel before use");
+   if (!config_.count_misses) {
+     NVE_LOG_WARNING_("GPUTable was configured without a key counter");
+     return;
 diff --git a/src/hierarchical_embedding_layer.cu b/src/hierarchical_embedding_layer.cu
 --- a/src/hierarchical_embedding_layer.cu
 +++ b/src/hierarchical_embedding_layer.cu
-@@ -122,6 +122,76 @@
+@@ -122,6 +122,124 @@
  }
  
  template <typename KeyType>
@@ -2592,6 +3088,54 @@ diff --git a/src/hierarchical_embedding_layer.cu b/src/hierarchical_embedding_la
 +  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
 +  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
 +  return table->cache_resize_metadata(expected_sets, tags_out, counterbits_out, ages_out);
++}
++
++template <typename KeyType>
++std::string HierarchicalEmbeddingLayer<KeyType>::prepare_cache_resize(size_t payload_bytes, size_t host_limit) {
++  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
++  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
++  auto handler = handler_at(0);
++  if (handler) handler->lock_modify();
++  try {
++    auto result = table->prepare_cache_resize(payload_bytes, host_limit);
++    if (handler) handler->unlock_preserving_resize();
++    return result;
++  } catch (...) {
++    if (handler) handler->unlock_preserving_resize();
++    throw;
++  }
++}
++
++template <typename KeyType>
++std::string HierarchicalEmbeddingLayer<KeyType>::commit_cache_resize(const std::string& token, size_t pool_limit, size_t host_limit) {
++  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
++  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
++  auto handler = handler_at(0);
++  if (handler) handler->lock_modify();
++  try {
++    auto result = table->commit_cache_resize(token, pool_limit, host_limit);
++    if (handler) handler->unlock_preserving_resize();
++    return result;
++  } catch (...) {
++    if (handler) handler->unlock_preserving_resize();
++    throw;
++  }
++}
++
++template <typename KeyType>
++std::string HierarchicalEmbeddingLayer<KeyType>::cancel_cache_resize(const std::string& token) {
++  auto table = std::dynamic_pointer_cast<GpuTable<KeyType>>(tables_.at(0));
++  NVE_CHECK_(table != nullptr, "First table is not a GPU cache");
++  auto handler = handler_at(0);
++  if (handler) handler->lock_modify();
++  try {
++    auto result = table->cancel_cache_resize(token);
++    if (handler) handler->unlock_preserving_resize();
++    return result;
++  } catch (...) {
++    if (handler) handler->unlock_preserving_resize();
++    throw;
++  }
 +}
 +
 +template <typename KeyType>

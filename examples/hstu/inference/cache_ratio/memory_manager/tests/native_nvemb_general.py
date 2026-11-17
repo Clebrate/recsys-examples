@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Opt-in actual NVEmbedding test; only run on the authorized GPU allocation.
-python general_native_probe.py --runtime-root /installed/nve --output result.json
+python native_nvemb_general.py --runtime-root /installed/nve --output result.json --prepared
 The caller supplies PYTHONPATH/LD_LIBRARY_PATH for that same runtime.
 """
 import argparse,json,os,time,traceback
@@ -18,15 +18,18 @@ def run(args,report):
  assert module.is_relative_to(args.runtime_root.resolve()),str(module)
  torch.cuda.set_device(args.device)
  device=torch.device('cuda',args.device)
- report.update(module=str(module),device=torch.cuda.get_device_name(args.device),stages=[])
+ report.update(module=str(module),device=torch.cuda.get_device_name(args.device),stages=[],prepared_resize=args.prepared)
  row=64;ways=8
- def make(payload,general=True,capacity=65536,maximum=4*M):
+ def make(payload,general=True,capacity=65536,maximum=4*M,backing_keys=None):
   os.environ['NVE_NVEMB_VMM_MAX_PAYLOAD_BYTES']=str(maximum if general else 0)
   os.environ['NVE_NVEMB_VMM_CHUNK_BYTES']=str(2*M)
   os.environ['NVE_NVEMB_VMM_GENERAL_REHASH']=str(int(general))
   os.environ['NVE_NVEMB_POLICY_OBSERVATION']='1'
   os.environ['NVE_NVEMB_POLICY_EVENT_CAPACITY']=str(capacity)
   ps=nve_ps.NVEParameterServer(num_embeddings=0,embedding_size=row//4,data_type=torch.float32,initializer=None,initial_size=1024)
+  if backing_keys is not None:
+   keys=torch.as_tensor(backing_keys,dtype=torch.int64,device=device).contiguous()
+   ps.insert(keys.cpu(),value(keys).cpu())
   sets=payload//(ways*row)
   emb=nve_layers.NVEmbedding(num_embeddings=1<<24,embedding_size=row//4,data_type=torch.float32,
    layer_type=nve_layers.LayerType.Hierarchical,gpu_cache_size=sets*(ways*row+104),host_cache_size=0,
@@ -64,9 +67,16 @@ def run(args,report):
   dest=before['keys']%n;order=np.lexsort((before['keys'],-score,dest));d=dest[order]
   start=np.maximum.accumulate(np.where(np.r_[True,d[1:]!=d[:-1]],np.arange(len(d)),0))
   keep=order[np.arange(len(order))-start<8];keep=keep[np.argsort(before['keys'][keep])]
-  plan=decode(b.plan_cache_resize(target,40<<30));assert plan['status']=='planned',plan
+  plan=decode((b.prepare_cache_resize if args.prepared else b.plan_cache_resize)(target,40<<30))
+  assert plan['status']==('prepared' if args.prepared else 'planned'),plan
   assert plan['host_staging_peak_bound_bytes']<=40<<30
-  applied=decode(b.apply_cache_resize(target,plan['generation'],32<<30,40<<30));assert applied['status']=='applied',applied
+  applied=decode(b.commit_cache_resize(plan['token'],32<<30,40<<30) if args.prepared else
+                 b.apply_cache_resize(target,plan['generation'],32<<30,40<<30));assert applied['status']=='applied',applied
+  if args.prepared:
+   assert applied['plan_reused'] and applied['token_consumed'] and applied['native_preflight_ms']==0
+   assert not decode(b.cache_resize_state())['prepared']
+   stale=decode(b.commit_cache_resize(plan['token'],32<<30,40<<30))
+   assert stale['status']=='rejected' and not stale['token_consumed']
   after=snap(emb)
   for field in ('keys','bits','ages'):assert np.array_equal(after[field],before[field][keep]),field
   assert after['state']['global_ts']==before['state']['global_ts']
@@ -85,6 +95,60 @@ def run(args,report):
  a=snap(legacy);b=snap(general);same(a,b);verify_values(legacy,a['keys']);verify_values(general,b['keys'])
  assert observe(legacy)['admission_eviction_count']==0;assert observe(general)['admission_eviction_count']==0
  report['stages'].append('original_vs_general_multibatch_LFU_bits_ages_values_equal')
+ if args.prepared:
+  binding=general.emb_layer;caps=decode(binding.cache_resize_capabilities())
+  assert caps['prepared_resize'] and caps['prepared_resize_version']==1
+  before=snap(general)
+  plan=decode(binding.prepare_cache_resize(3*M,40<<30));assert plan['status']=='prepared',plan
+  token=plan['token'];assert isinstance(token,str) and token
+  assert plan['prepared_host_bytes']>0
+  assert decode(binding.cache_resize_state())['prepared_token']==token
+  duplicate=decode(binding.prepare_cache_resize(M,40<<30));assert duplicate['status']=='rejected'
+  invalid=token+'invalid'
+  for operation in (lambda:binding.cancel_cache_resize(invalid),
+                    lambda:binding.commit_cache_resize(invalid,32<<30,40<<30)):
+   rejected=decode(operation());assert rejected['status']=='rejected' and not rejected['token_consumed']
+   assert decode(binding.cache_resize_state())['prepared_token']==token
+  k=torch.as_tensor(before['keys'][:1],device=device,dtype=torch.int64).contiguous()
+  # These real public calls must fail before enqueueing while the saved plan is live.
+  for operation in (lambda:general(k),lambda:general.insert(k,value(k),table_id=0)):
+   try:operation()
+   except RuntimeError as error:assert 'resize' in str(error).lower(),str(error)
+   else:raise AssertionError('Prepared cache accepted a data operation')
+  torch.cuda.synchronize()
+  cancelled=decode(binding.cancel_cache_resize(token));assert cancelled['status']=='cancelled'
+  assert not decode(binding.cache_resize_state())['prepared'];same(before,snap(general))
+  stale=decode(binding.cancel_cache_resize(token));assert stale['status']=='rejected' and not stale['token_consumed']
+  verify_values(general,before['keys'])
+  for pool_limit,host_limit in ((1,40<<30),(32<<30,1)):
+   before=snap(general);plan=decode(binding.prepare_cache_resize(3*M,40<<30))
+   assert plan['status']=='prepared'
+   rejected=decode(binding.commit_cache_resize(plan['token'],pool_limit,host_limit))
+   assert rejected['status']=='rejected' and rejected['token_consumed']
+   assert rejected['contexts_rebuilt_before_return'] and not decode(binding.cache_resize_state())['prepared']
+   same(before,snap(general));verify_values(general,before['keys'])
+  report['stages'].append('prepared_cancel_stale_token_blocked_data_calls_and_budget_rejection_restore_contexts')
+  # Native admission accumulates 65,536 input rows. Preserve a half-full
+  # collection across the transaction, then finish it with disjoint keys.
+  pending_keys=np.arange(2048,dtype=np.int64)
+  controls=[]
+  for transition in ('none','cancel','commit'):
+   pending=make(2*M,backing_keys=pending_keys);binding=pending.emb_layer
+   first=torch.as_tensor(np.tile(pending_keys[:1024],32),device=device,dtype=torch.int64)
+   actual=pending(first);torch.cuda.synchronize();assert torch.equal(actual,value(first))
+   assert observe(pending)['resident_rows']==0, 'Fixture already admitted its first half'
+   if transition!='none':
+    plan=decode(binding.prepare_cache_resize(3*M,40<<30));assert plan['status']=='prepared'
+    if transition=='cancel':assert decode(binding.cancel_cache_resize(plan['token']))['status']=='cancelled'
+    else:assert decode(binding.commit_cache_resize(plan['token'],32<<30,40<<30))['status']=='applied'
+   second=torch.as_tensor(np.tile(pending_keys[1024:],32),device=device,dtype=torch.int64)
+   actual=pending(second);torch.cuda.synchronize();assert torch.equal(actual,value(second))
+   observation=observe(pending);state=snap(pending)
+   assert observation['resident_rows']==len(pending_keys), 'Pending admission rows were lost'
+   assert np.array_equal(state['keys'],pending_keys)
+   controls.append(state);verify_values(pending,pending_keys)
+  same(controls[0],controls[1]);same(controls[0],controls[2])
+  report['stages'].append('pending_half_threshold_auto_insert_survives_cancel_and_commit_exact_values_bits_ages')
  receipts=[]
  for target in (3*M,M):
   before,after,receipt=resize(general,target);receipts.append(receipt)
@@ -148,7 +212,7 @@ def run(args,report):
  report['status']='passed'
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--runtime-root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--device',type=int,default=0);a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--runtime-root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--device',type=int,default=0);p.add_argument('--prepared',action='store_true');a=p.parse_args()
  report={'status':'running','started':time.time()}
  try:run(a,report)
  except BaseException:report.update(status='failed',traceback=traceback.format_exc())
