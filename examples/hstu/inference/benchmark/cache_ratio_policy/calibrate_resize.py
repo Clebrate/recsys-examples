@@ -8,7 +8,7 @@ the maximum observed non-noop action plus observation drain is the preset.
 After every resize, replay the last prefill batch outside the resize timer and
 compare with its saved CPU output. Those probes fill caches and touch ages, so
 later samples include their real state changes; this is not an untouched loop.
-This sparse prefilled fixture does not establish a full-cache worst-case cost.
+This prefilled fixture does not establish a full-cache worst-case cost.
 """
 import argparse
 import gc
@@ -26,7 +26,6 @@ import cache_ratio_policy_benchmark as bench
 TRANSFER_BYTES = 192 * bench.MIB
 TRANSFERS = (-TRANSFER_BYTES, TRANSFER_BYTES, TRANSFER_BYTES, -TRANSFER_BYTES)
 PREFILL_REQUESTS = 256
-MAX_PREFILL_REQUESTS = 8192
 PROBE_RTOL, PROBE_ATOL = 0.02, 0.005
 
 
@@ -50,6 +49,17 @@ def populated_embedding(observation):
         if type(resident) is not int or type(capacity) is not int or not 0 <= resident <= capacity:
             raise ValueError("Invalid native population observation: " + name)
     return all(table["resident_rows"] > 0 for table in tables.values())
+
+
+def population_counts(observation):
+    """Keep scalar evidence while discarding drained per-key event arrays."""
+    fields = ("enabled", "complete", "overflow", "resident_rows", "capacity_rows",
+              "ps_find_count", "ps_find_calls", "ps_find_complete",
+              "admission_eviction_count", "capacity_eviction_count", "observation_serial")
+    return {"wall_ms": observation["wall_ms"], "tables": {
+        name: {field: table[field] for field in fields if field in table}
+        for name, table in observation["embedding"]["tables"].items()
+    }}
 
 
 def verify_transfer(before, after, delta):
@@ -77,10 +87,11 @@ def main():
               "configuration": {"payload_budget_bytes": bench.BUDGET, "chunk_bytes": bench.CHUNK,
                                 "peak_cache_bytes": 32 * bench.GIB, "host_staging_limit_bytes": 40 * bench.GIB,
                                 "seed": 303, "minimum_prefill_requests": PREFILL_REQUESTS,
-                                "maximum_prefill_requests": MAX_PREFILL_REQUESTS, "rounds": 2,
+                                "maximum_prefill_requests": None, "rounds": 2,
+                                "prefill_bound": "complete frozen input; stop once both tables have resident rows",
                                 "initial_nominal_ratio": 0.5, "kv_transfer_bytes_each_round": list(TRANSFERS)},
               "samples": [], "prefill_batches": [], "all_samples_retained": True,
-              "scope": "cost calibration with sparse real-request prefill; not arrival-paced performance or a full-cache worst-case bound",
+              "scope": "cost calibration with populated real-request prefill; not arrival-paced performance or a full-cache worst-case bound",
               "timing_scope": "already completed real prefill; explicit pre-sync, shared plan/apply, post-sync, post-resize observer drain and ledger read; no KV generation/model forward in timer",
               "probe_scope": "replay the same last real prefill batch after each resize, outside resize timing; real KV/embedding refill and age touches persist into later samples"}
     backend = None
@@ -88,6 +99,7 @@ def main():
     started = time.perf_counter()
     try:
         manifest, sequences, full_rows, report["input"] = bench.load_inputs(args)
+        report["configuration"]["maximum_prefill_requests"] = len(full_rows)
         report["code_identity"] = bench.code_identity()
         os.environ.update(NVE_NVEMB_VMM_GENERAL_REHASH="1", NVE_NVEMB_VMM_MAX_PAYLOAD_BYTES=str(bench.BUDGET),
                           NVE_NVEMB_VMM_CHUNK_BYTES=str(bench.CHUNK), NVE_NVEMB_VMM_FAST_REHASH="1",
@@ -113,7 +125,10 @@ def main():
                           report["startup_observation_drain"]["embedding"]["tables"].values()),
                       "Native policy observation is not enabled")
         report["phase"] = "offline_real_prefill"
-        prefix = full_rows[:MAX_PREFILL_REQUESTS]
+        # Native admission accumulates 65,536 input rows; a user-context KV hit
+        # can skip its embedding lookup entirely. A small request-count cap
+        # therefore cannot prove that both tables have actually admitted rows.
+        prefix = full_rows
         head = 0
         prefill_started = time.perf_counter()
         population_checks = report["prefill_population_checks"] = []
@@ -134,7 +149,7 @@ def main():
             if head >= PREFILL_REQUESTS:
                 population = drain(memory)
                 populated = populated_embedding(population)
-                population_checks.append({"completed_requests": head, "observation": population,
+                population_checks.append({"completed_requests": head, "observation": population_counts(population),
                                           "both_tables_populated": populated})
                 if populated:
                     break

@@ -36,6 +36,19 @@ class CalibrationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 calibration.populated_embedding(bad)
 
+    def test_population_evidence_does_not_retain_drained_key_arrays(self):
+        observation = self.observation(1, 2)
+        observation["wall_ms"] = 1.5
+        observation["kv_evictions"] = {"keys": [1, 2, 3]}
+        observation["embedding"]["tables"]["user_id"].update(
+            ps_find_count=17, ps_find_keys=[3, 4], capacity_eviction_keys=[8])
+        compact = calibration.population_counts(observation)
+        self.assertEqual(compact["tables"]["user_id"]["ps_find_count"], 17)
+        self.assertEqual(compact["tables"]["video_id"]["resident_rows"], 2)
+        self.assertNotIn("ps_find_keys", compact["tables"]["user_id"])
+        self.assertNotIn("capacity_eviction_keys", compact["tables"]["user_id"])
+        self.assertNotIn("kv_evictions", compact)
+
     def state(self, kv):
         return {"kv": {"payload_bytes": kv},
                 "embedding": {"payload_bytes": calibration.bench.BUDGET - kv}}
