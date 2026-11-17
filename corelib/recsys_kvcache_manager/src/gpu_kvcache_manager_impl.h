@@ -68,6 +68,7 @@ public:
     // Internal VMM coordinator hooks. They do not allocate/release backing.
     // Only an exclusive, synchronized GPU-only backend may use these methods.
     using VmmSnapshot = std::vector<std::tuple<int64_t, int, int, std::vector<int>>>;
+    size_t vmm_resident_pages() const;
     VmmSnapshot vmm_snapshot() const;
     void enable_vmm_events();
     std::vector<std::pair<int64_t, int>> drain_vmm_capacity_evictions();

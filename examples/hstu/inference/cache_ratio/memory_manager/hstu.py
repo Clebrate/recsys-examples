@@ -107,6 +107,7 @@ class HstuVmmBackend:
         if not all(
             hasattr(_impl_factory, name)
             for name in (
+                "_vmm_resident_pages",
                 "_vmm_snapshot",
                 "_resize_vmm_metadata",
                 "_enable_vmm_events",
@@ -299,7 +300,7 @@ class HstuVmmBackend:
     @property
     def resident_payload_bytes(self):
         return (
-            sum(len(row[3]) for row in self.impl_._vmm_snapshot())
+            self.impl_._vmm_resident_pages()
             * self._pool.page_bytes
             * self.num_layers
         )

@@ -183,6 +183,21 @@ void GPUKVCacheManagerImpl::evict_all()
         _empty_pages.push(page_id);
 };
 
+size_t GPUKVCacheManagerImpl::vmm_resident_pages() const {
+    if (num_buffer_pages != 0 || total_offloaded_pages != 0 ||
+        !_uid_offload_lock.empty() || !_uid_inference_lock.empty()) {
+        throw std::runtime_error("VMM requires an idle GPU-only page manager");
+    }
+    const size_t free_pages = _empty_pages.size();
+    if (num_primary_cache_pages < 0 ||
+        free_pages > static_cast<size_t>(num_primary_cache_pages)) {
+        throw std::runtime_error("Invalid VMM free-page count");
+    }
+    // The allocator already maintains this queue on allocation, eviction and
+    // resize. This O(1) count does not replace vmm_snapshot's resize validation.
+    return static_cast<size_t>(num_primary_cache_pages) - free_pages;
+}
+
 GPUKVCacheManagerImpl::VmmSnapshot GPUKVCacheManagerImpl::vmm_snapshot() const {
     if (num_buffer_pages != 0 || total_offloaded_pages != 0 ||
         !_uid_offload_lock.empty() || !_uid_inference_lock.empty()) {

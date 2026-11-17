@@ -57,6 +57,7 @@ PYBIND11_MODULE(kvcache_cpp, m) {
          py::arg("max_batch_size"),
          py::arg("max_sequence_length"),
          py::arg("device_idx"))
+    .def("_vmm_resident_pages", &kvcache::GPUKVCacheManagerImpl::vmm_resident_pages)
     .def("_vmm_snapshot", &kvcache::GPUKVCacheManagerImpl::vmm_snapshot)
     .def("_enable_vmm_events", &kvcache::GPUKVCacheManagerImpl::enable_vmm_events)
     .def("_drain_vmm_capacity_evictions", &kvcache::GPUKVCacheManagerImpl::drain_vmm_capacity_evictions)

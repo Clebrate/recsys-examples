@@ -17,11 +17,19 @@ class FakeImpl:
         self.pages = args[5]
         self.rows = {}
         self.fail_commit = False
+        self.snapshot_calls = self.resident_calls = 0
 
     def _vmm_snapshot(self):
+        self.snapshot_calls += 1
         return sorted(
             (uid, 0, length, list(pages)) for uid, (length, pages) in self.rows.items()
         )
+
+    def _vmm_resident_pages(self):
+        # Test double semantics only: the real native getter uses its maintained
+        # free-page queue, while these tests directly edit the fake row mapping.
+        self.resident_calls += 1
+        return sum(len(pages) for _, pages in self.rows.values())
 
     def _resize_vmm_metadata(self, target, expected_pages, expected):
         if self.fail_commit:
@@ -113,6 +121,48 @@ class HstuTests(unittest.TestCase):
         )
         self.addCleanup(lambda: backend.close(at_batch_barrier=True))
         return backend, d
+
+    def test_stats_uses_scalar_residency_without_materializing_snapshot(self):
+        b, _ = self.make(num_primary_cache_pages=6)
+        b.impl_.rows = {11: (4, [0, 1]), 12: (2, [4])}
+        original = b.impl_._vmm_snapshot
+        def forbidden():
+            raise AssertionError("Stats must not materialize full metadata")
+        b.impl_._vmm_snapshot = forbidden
+        try:
+            self.assertEqual(b.resident_payload_bytes, 3 * b._pool.page_bytes * b.num_layers)
+            state = b.stats()
+            self.assertEqual(state["resident_payload_bytes"], 48)
+            self.assertEqual(state["payload_bytes"], 96)
+            b.impl_.evict(11)
+            self.assertEqual(b.stats()["resident_payload_bytes"], 16)
+            b.impl_.evict_all()
+            self.assertEqual(b.stats()["resident_payload_bytes"], 0)
+        finally:
+            b.impl_._vmm_snapshot = original
+
+    def test_resize_keeps_full_snapshot_validation(self):
+        b, _ = self.make()
+        b.impl_.rows = {11: (4, [0, 1])}
+        before = b.impl_.snapshot_calls
+        b.stats()
+        self.assertEqual(b.impl_.snapshot_calls, before)
+        b.resize_pages(4, at_batch_barrier=True)
+        self.assertGreater(b.impl_.snapshot_calls, before)
+        self.assertEqual(b.impl_._vmm_resident_pages(), 2)
+
+    def test_missing_scalar_hook_rejects_otherwise_compatible_old_extension(self):
+        class LegacyImpl:
+            __init__ = FakeImpl.__init__
+            _vmm_snapshot = FakeImpl._vmm_snapshot
+            _resize_vmm_metadata = FakeImpl._resize_vmm_metadata
+            _enable_vmm_events = FakeImpl._enable_vmm_events
+            _drain_vmm_capacity_evictions = FakeImpl._drain_vmm_capacity_evictions
+        driver = FakeDriver()
+        with self.assertRaisesRegex(RuntimeError, "Rebuild"):
+            HstuVmmBackend(config(), max_pages=8, driver=driver, _torch=TORCH,
+                           _impl_factory=LegacyImpl, _table_factory=FakeLayer)
+        self.assertEqual(driver.events, [])
 
     def test_growth_retains_native_prefix_ids_values_and_layer_addresses(self):
         b, d = self.make()
