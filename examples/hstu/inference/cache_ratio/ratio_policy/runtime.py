@@ -58,6 +58,7 @@ class PolicyRuntime:
         self._replay_clock = None
         self._last_end = 0.0
         self._arrivals = self._tokens = self._completed = self._queue = 0
+        self._last_throughput = None
         self.batches = self.safe_rejections = self.observation_gaps = 0
         self._kv_rows, self._dense_calls = [], 0
         if _torch is None:
@@ -227,6 +228,7 @@ class PolicyRuntime:
                         CacheStats(actual["embedding"]["payload_bytes"], resident, misses,
                                    emb_reuse, ps_ms if complete else None),
                         self.resize_cost_ms, self.memory.payload_budget_bytes)
+        self._last_throughput = window.throughput()
         self._last_end, self._arrivals, self._tokens = now, arrivals, tokens
         self._completed, self._queue = completed_count, arrivals - completed_count
         if self.mode == "adaptive" and not final:
@@ -247,6 +249,17 @@ class PolicyRuntime:
             after_time = self._replay_clock()
             self._native(post, after, after_time)  # Check overflow/serial too.
             result["resize_eviction_events"] = self._record_evictions(post, after_time)
+            if result.get("resize_interval") is not None:
+                result["resize_pause"] = {
+                    "start_s": result["resize_interval"]["start_s"],
+                    "end_s": self._replay_clock(),
+                    "scope": "resize call plus post-resize observation, ledger and eviction drain",
+                }
+        elif result.get("resize_interval") is not None:
+            result["resize_pause"] = {
+                **result["resize_interval"],
+                "scope": "resize attempt including preflight; no applied action",
+            }
         self.batches += 1
         return {**result, "mode": self.mode, "final": bool(final), "window": asdict(window),
                 "batch_observation": {"dense_cuda_span_ms": dense_ms, "ps_find_work_ms": ps_ms if complete else None,
@@ -258,6 +271,13 @@ class PolicyRuntime:
 
     def stats(self):
         return {"mode": self.mode, "batches": self.batches, "bounds": self.bounds,
+                "resize_cost_mode": self.policy.config.resize_cost_mode,
+                "last_window_throughput": self._last_throughput,
+                "completion_rate_rps": self._completed / self._last_end if self._last_end else None,
+                "arrival_rate_rps": self._arrivals / self._last_end if self._last_end else None,
+                "completion_deficit_rps": max(0, self._arrivals - self._completed) / self._last_end
+                    if self._last_end else None,
+                "throughput_scope": "observed arrival-clock rates through last window; last-window input_limited is an empty-boundary hint, not a service-capacity estimate",
                 "resize_cost_ms": self.resize_cost_ms, "proposals": self.policy.proposals,
                 "applied_actions": self.policy.applied_actions, "holds": dict(self.policy.holds),
                 "safe_rejections": self.safe_rejections, "observation_gaps": self.observation_gaps,

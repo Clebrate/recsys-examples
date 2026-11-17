@@ -18,6 +18,7 @@ import sys
 BENCH_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCH_DIR))
 import cache_ratio_policy_benchmark as bench
+from cache_ratio_policy.pause_counterfactual import analyze_run
 
 MODES = ("fixed", "observe_only", "adaptive")
 
@@ -49,6 +50,7 @@ def signature(report, compiler_cache=None):
             "gc_thresholds": report["gc"]["thresholds"], "gpu": report["gpu_identity"],
             "compiler_cache_seed": compiler_cache["seed_identity"] if compiler_cache is not None else None,
             "resize_calibration": report.get("resize_calibration"),
+            "resize_cost_mode": report["configuration"].get("resize_cost_mode", "amortized"),
             "host_staging_limit_gib": report["configuration"].get("host_staging_limit_gib"),
             "code": report["code_identity"],
             "libraries": {Path(path).name: item["sha256"] for path, item in report["loaded_libraries"].items()},
@@ -156,7 +158,9 @@ def audit(directory):
             bench.require(events == 0 and report["observer"] == {"enabled": False}, "Fixed mode installed observation")
         if report["mode"] in ("fixed", "observe_only"):
             bench.require(report["final_capacity"]["actions"] == report["initial_capacity"]["actions"], "Control changed capacity")
+        pause_diagnostic = analyze_run(directory)
         result.update(status="passed", actual_requests=expected, actual_batches=batches,
+                      pause_counterfactual=pause_diagnostic,
                       metrics=calculated, policy_events=events, decision_reasons=dict(reasons),
                       action_status_counts=dict(action_status), physical_resize_count=report["final_capacity"]["actions"],
                       match_signature=signature(report, compiler_cache),
@@ -216,13 +220,29 @@ def summarize(root):
             errors.append(f"Round{round_index} identities/settings do not match")
             continue
         by_mode = {r["mode"]: flatten(r) for r in group}
+        diagnostics = {r["mode"]: r["pause_counterfactual"] for r in group}
         for treatment, control in (("observe_only", "fixed"), ("adaptive", "fixed"), ("adaptive", "observe_only")):
             left, right = by_mode[treatment], by_mode[control]
+            diagnostic = {"status": "unsupported"}
+            if all(diagnostics[m]["status"] == "supported" for m in (treatment, control)):
+                cf_left = diagnostics[treatment]["counterfactual"]
+                cf_right = diagnostics[control]["counterfactual"]
+                diagnostic = {
+                    "status": "supported",
+                    "completion_throughput_relative_change": (
+                        cf_left["completion_throughput_requests_s"] / cf_right["completion_throughput_requests_s"] - 1),
+                    "queue_mean_difference_ms": cf_left["queue_ms"]["mean"] - cf_right["queue_ms"]["mean"],
+                    "e2e_mean_difference_ms": cf_left["e2e_ms"]["mean"] - cf_right["e2e_ms"]["mean"],
+                    "scope": "fixed observed batches and service; remove measured resize pauses only; not actual zero-cost performance",
+                }
             comparisons.append({"round": round_index, "treatment": treatment, "control": control,
                                 "scope": reference["scope"],
+                                "direct_resize_pause_removed": diagnostic,
                                 "differences_treatment_minus_control": {key: left[key] - right[key] for key in left
                                     if key not in ("round", "mode", "scope", "requests", "batches")},
-                                "e2e_mean_relative_change": left["e2e_ms_mean"] / right["e2e_ms_mean"] - 1})
+                                "e2e_mean_relative_change": left["e2e_ms_mean"] / right["e2e_ms_mean"] - 1,
+                                "completion_throughput_relative_change": (
+                                    left["completion_throughput_requests_s"] / right["completion_throughput_requests_s"] - 1)})
     if not runs:
         errors.append("No arm summaries found")
     if any(r["status"] != "passed" for r in runs):
@@ -236,7 +256,8 @@ def summarize(root):
             "notes": ["Every raw request and batch was audited; all tails retained, nearest-rank full-request percentiles.",
                       "Difference sign is treatment minus control; each complete matched round is the comparison unit.",
                       "Observe-only minus fixed includes observation, policy-decision and diagnostic logging overhead; adaptive minus observe-only includes resize execution and resulting cache/queue changes.",
-                      "Observation, GC, resizing, refusal and refill costs remain on the original arrival clock; no cost subtraction.",
+                      "Actual metrics retain observation, GC, resizing, refusal and refill costs on the original arrival clock.",
+                      "pause_counterfactual is a separate fixed-observed-batch/service diagnostic removing only measured resize pauses; it is not a measured zero-cost strategy or causal benefit.",
                       "Fixed10s windows are descriptive correlated slices, not independent repeats. No significance or global optimum claim.",
                       "Input-limited200rps completion rate does not establish saturation throughput.",
                       "Zero applied resize means this run cannot establish a benefit from changing the ratio.",
@@ -258,7 +279,8 @@ def main():
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
             writer.writeheader(); writer.writerows(rows)
     deltas = [{"round": row["round"], "scope": row["scope"], "treatment": row["treatment"], "control": row["control"],
-               **row["differences_treatment_minus_control"], "e2e_mean_relative_change": row["e2e_mean_relative_change"]}
+               **row["differences_treatment_minus_control"], "e2e_mean_relative_change": row["e2e_mean_relative_change"],
+               "completion_throughput_relative_change": row["completion_throughput_relative_change"]}
               for row in result["comparisons"]]
     with (output / "comparisons.csv").open("w", newline="") as stream:
         if deltas:

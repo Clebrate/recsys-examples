@@ -221,6 +221,7 @@ def code_identity():
              hstu / "inference/inference_gr_ranking.py", hstu / "modules/nve_embeddingcollection.py",
              hstu / "inference/configs/kuairand_1k_inference_ranking.gin"]
     paths += sorted((hstu / "inference/cache_ratio").rglob("*.py"))
+    paths += sorted((hstu / "inference/benchmark/cache_ratio_policy").glob("*.py"))
     return {str(path.relative_to(hstu)): sha_file(path) for path in paths if "tests" not in path.parts}
 
 
@@ -388,6 +389,8 @@ def parser():
     result.add_argument("--scope", choices=("full", "smoke"), default="full")
     result.add_argument("--smoke-requests", type=int, default=128)
     result.add_argument("--resize-calibration", type=Path)
+    result.add_argument("--resize-cost-mode", choices=("amortized", "diagnostic"), default="amortized",
+                        help="diagnostic executes supported proposals without a resize-cost veto; actual costs remain timed")
     result.add_argument("--peak-cache-gib", type=int, default=32)
     result.add_argument("--host-staging-limit-gib", type=int, default=40)
     result.add_argument("--round-index", type=int, default=1)
@@ -447,8 +450,10 @@ def main(argv=None):
             resize_cost, report["resize_calibration"] = calibration(args.resize_calibration, report["loaded_libraries"])
             if args.mode != "fixed":
                 from inference.cache_ratio.ratio_policy.runtime import PolicyRuntime
+                from inference.cache_ratio.ratio_policy.adaptive import Config
                 runtime = PolicyRuntime(backend.model, mode="observe" if args.mode == "observe_only" else "adaptive",
-                                        resize_cost_ms=resize_cost)
+                                        resize_cost_ms=resize_cost,
+                                        config=Config(resize_cost_mode=args.resize_cost_mode))
             report["gc"]["automatic_gc_enabled_before_replay"] = gc.isenabled()
             require(report["gc"]["automatic_gc_enabled_before_replay"], "Automatic GC was disabled during model/runtime setup")
             report["setup_wall_s"] = time.perf_counter() - started

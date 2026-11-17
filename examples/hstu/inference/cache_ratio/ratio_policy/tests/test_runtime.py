@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 from examples.hstu.inference.cache_ratio.memory_manager.shared import SharedCacheMemory
+from examples.hstu.inference.cache_ratio.ratio_policy.adaptive import Config
 from examples.hstu.inference.cache_ratio.ratio_policy.runtime import PolicyRuntime
 
 
@@ -115,8 +116,9 @@ class RuntimeTests(unittest.TestCase):
         for runtime in self.runtimes:
             runtime.close()
 
-    def make(self, mode="observe", cost=0.01):
+    def make(self, mode="observe", cost=0.01, config=None):
         runtime = PolicyRuntime(self.model, mode=mode, resize_cost_ms=cost,
+                                config=config,
                                 clock=lambda: self.now,
                                 _torch=SimpleNamespace(cuda=SimpleNamespace(Event=Event)))
         runtime.start(lambda: self.now)
@@ -231,6 +233,181 @@ class RuntimeTests(unittest.TestCase):
         result = self.batch(runtime, 3, 2)
         self.assertEqual(result["decision"]["reason"], "missing_resize_cost")
 
+    def test_diagnostic_applies_without_calibration_and_preserves_none(self):
+        runtime = self.make("adaptive", cost=None,
+                            config=Config(resize_cost_mode="diagnostic"))
+        self.seed_reuse(runtime)
+        result = self.batch(runtime, 3, 2)
+        self.assertEqual(result["action"]["status"], "applied")
+        self.assertIsNone(result["window"]["resize_cost_ms"])
+        self.assertIsNone(runtime.stats()["resize_cost_ms"])
+        self.assertEqual(result["decision"]["resize_cost_mode"], "diagnostic")
+        self.assertEqual(runtime.stats()["resize_cost_mode"], "diagnostic")
+        self.assertAlmostEqual(runtime.stats()["completion_rate_rps"], 2 / 3)
+        self.assertTrue(runtime.stats()["last_window_throughput"]["input_limited"])
+
+    def test_diagnostic_missing_observation_still_holds(self):
+        runtime = self.make("adaptive", cost=None,
+                            config=Config(resize_cost_mode="diagnostic"))
+        self.seed_reuse(runtime)
+        self.emb.next = dict(complete=False)
+        result = self.batch(runtime, 3, 2)
+        self.assertEqual(result["decision"]["reason"], "missing_cache_observation")
+        self.assertIsNone(result["action"])
+        self.assertEqual(self.memory.actions, 0)
+
+    def test_resize_pause_includes_post_observation_and_preserves_call_interval(self):
+        runtime = self.make("adaptive")
+        self.seed_reuse(runtime)
+        original_observe = self.memory.observe
+        original_native = self.emb.policy_observation
+
+        def timed_observe(*args, **kwargs):
+            result = original_observe(*args, **kwargs)
+            self.now = 3.25
+            result["resize_interval"] = {"start_s": 3.0, "end_s": 3.25}
+            return result
+
+        def delayed_post_observation(**kwargs):
+            result = original_native(**kwargs)
+            if self.memory.actions:
+                self.now += 0.5
+            return result
+
+        self.memory.observe = timed_observe
+        self.emb.policy_observation = delayed_post_observation
+        result = self.batch(runtime, 3, 2)
+        self.assertEqual(result["resize_interval"], {"start_s": 3.0, "end_s": 3.25})
+        self.assertEqual(result["resize_pause"]["start_s"], 3.0)
+        self.assertEqual(result["resize_pause"]["end_s"], 3.75)
+
+    def test_real_shared_interval_covers_prepare_and_both_cache_mutations(self):
+        runtime = self.make("adaptive")
+        self.seed_reuse(runtime)
+        plan, emb_resize, kv_resize = self.emb.plan_resize, self.emb.resize, self.kv.resize_pages
+        phases = []
+
+        def timed_plan(n):
+            phases.append("prepare")
+            self.now += 0.125
+            return plan(n)
+
+        def timed_embedding(plan, **kwargs):
+            phases.append("embedding")
+            self.now += 0.25
+            return emb_resize(plan, **kwargs)
+
+        def timed_kv(n, **kwargs):
+            phases.append("kv")
+            self.now += 0.125
+            return kv_resize(n, **kwargs)
+
+        self.emb.plan_resize = timed_plan
+        self.emb.resize = timed_embedding
+        self.kv.resize_pages = timed_kv
+        # Keep SharedCacheMemory.observe and resize_ratio unmodified: their
+        # actual interval and duration accounting are what this test checks.
+        result = self.batch(runtime, 3, 2)
+        self.assertEqual(phases, ["prepare", "embedding", "kv"])
+        self.assertEqual(result["action"]["status"], "applied")
+        self.assertEqual(result["resize_interval"]["start_s"], 3)
+        self.assertEqual(result["resize_interval"]["end_s"], 3.5)
+        self.assertEqual(result["action"]["prepare_ms"], 125)
+        self.assertEqual(result["action"]["apply_ms"], 375)
+        self.assertEqual(result["action"]["action_ms"], 500)
+        self.assertEqual(result["resize_pause"]["end_s"], 3.5)
+
+    def test_real_shared_rounded_noop_records_planning_interval(self):
+        runtime = self.make("adaptive")
+        self.seed_reuse(runtime)
+        before = self.memory.stats()
+        original = self.emb.plan_resize
+
+        def coarse_kv(n, round_up=False):
+            n = ((n + 99) // 100 if round_up else n // 100) * 100
+            return dict(payload_bytes=n, allocated_physical_bytes=n,
+                        target_pages=n, extra_peak_bytes=0)
+
+        def timed_plan(n):
+            self.now += 0.25
+            return original(n)
+
+        self.kv.plan_resize_bytes = coarse_kv
+        self.emb.plan_resize = timed_plan
+        result = self.batch(runtime, 3, 2)
+        self.assertEqual(result["action"]["status"], "rounded_noop")
+        self.assertEqual(result["action"]["completed"], [])
+        self.assertEqual(self.memory.stats(), before)
+        self.assertEqual(result["resize_interval"]["start_s"], 3)
+        self.assertEqual(result["resize_interval"]["end_s"], 3.25)
+        self.assertEqual(result["action"]["action_ms"], 250)
+        self.assertEqual(runtime.policy.applied_actions, 0)
+
+    def test_real_shared_rejected_preflight_records_elapsed_time_without_mutation(self):
+        runtime = self.make("adaptive")
+        self.seed_reuse(runtime)
+        before = self.memory.stats()
+
+        def declined(n):
+            self.now += 0.5
+            raise ValueError("native preflight declined before mutation")
+
+        self.emb.plan_resize = declined
+        result = self.batch(runtime, 3, 2)
+        self.assertIsNone(result["action"])
+        self.assertTrue(result["rejection"]["unchanged"])
+        self.assertEqual(self.memory.stats(), before)
+        self.assertEqual(result["resize_interval"]["start_s"], 3)
+        self.assertEqual(result["resize_interval"]["end_s"], 3.5)
+        self.assertEqual(result["resize_pause"]["end_s"], 3.5)
+
+    def test_real_shared_hold_does_not_plan_or_emit_interval(self):
+        runtime = self.make("adaptive", cost=None)
+        self.seed_reuse(runtime)
+
+        def unexpected_plan(n):
+            raise AssertionError("HOLD must not call resize preflight")
+
+        self.emb.plan_resize = unexpected_plan
+        result = self.batch(runtime, 3, 2)
+        self.assertEqual(result["decision"]["reason"], "missing_resize_cost")
+        self.assertIsNone(result["action"])
+        self.assertNotIn("resize_interval", result)
+        self.assertNotIn("resize_pause", result)
+
+    def test_rejected_preflight_interval_is_retained_without_action(self):
+        runtime = self.make("adaptive")
+        self.seed_reuse(runtime)
+        self.emb.decline = True
+        original = self.memory.observe
+
+        def timed_rejection(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.now = 3.5
+            result["resize_interval"] = {"start_s": 3.0, "end_s": 3.5}
+            return result
+
+        self.memory.observe = timed_rejection
+        result = self.batch(runtime, 3, 2)
+        self.assertIsNone(result["action"])
+        self.assertEqual(result["resize_pause"]["start_s"], 3.0)
+        self.assertEqual(result["resize_pause"]["end_s"], 3.5)
+
+    def test_legacy_executor_does_not_invent_resize_pause(self):
+        runtime = self.make("adaptive")
+        self.seed_reuse(runtime)
+        original = self.memory.observe
+
+        def legacy(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result.pop("resize_interval", None)
+            return result
+
+        self.memory.observe = legacy
+        result = self.batch(runtime, 3, 2)
+        self.assertIsNotNone(result["action"])
+        self.assertNotIn("resize_pause", result)
+
     def test_final_batch_never_executes_resize(self):
         runtime = self.make("adaptive")
         self.seed_reuse(runtime)
@@ -251,6 +428,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["window"]["start_s"], 1)
         self.assertEqual(result["window"]["arrivals"], 4)
         self.assertEqual(result["window"]["queue_at_end"], 3)
+        signals = runtime.stats()["last_window_throughput"]
+        self.assertEqual(signals["arrival_rate_rps"], 2)
+        self.assertEqual(signals["completion_rate_rps"], 0.5)
+        self.assertEqual(signals["completion_deficit_rps"], 1.5)
+        self.assertFalse(signals["input_limited"])
 
     def test_close_restores_instance_slots_and_rejects_foreign_hooks(self):
         original = self.dense.forward_with_kvcache

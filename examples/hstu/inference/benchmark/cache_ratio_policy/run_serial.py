@@ -142,6 +142,7 @@ def main():
     p.add_argument("--results-root", type=Path, required=True)
     p.add_argument("--lease-end-utc", required=True, help="Verified allocation end, ISO8601 with timezone")
     p.add_argument("--resize-calibration", type=Path)
+    p.add_argument("--resize-cost-mode", choices=("amortized", "diagnostic"), default="amortized")
     p.add_argument("--compiler-cache-seed", type=Path, help="Frozen directory containing manifest.json, triton/ and cuda/; copied privately before every arm")
     p.add_argument("--scope", choices=("full", "smoke"), default="full")
     p.add_argument("--smoke-requests", type=int, default=128)
@@ -166,7 +167,7 @@ def main():
     args.results_root.mkdir(parents=True, exist_ok=False)
     record = {"schema_version": 1, "status": "planned", "lease_end_utc": ending.astimezone(timezone.utc).isoformat(),
               "arm_budget_s": args.arm_budget_s, "lease_guard_s": args.lease_guard_s,
-              "scope": args.scope, "round1": list(MODES), "round2": list(reversed(MODES)) if args.rounds == 2 else [],
+              "scope": args.scope, "resize_cost_mode": args.resize_cost_mode, "round1": list(MODES), "round2": list(reversed(MODES)) if args.rounds == 2 else [],
               "required_first_round_arms": 3, "runs": [], "optional_reverse_round": "pending" if args.rounds == 2 else "not_requested",
               "compiler_cache": {"enabled": args.compiler_cache_seed is not None},
               "resource_scope": "caller verified existing allocation and GPU idleness; no allocation or remote access by this script"}
@@ -199,6 +200,7 @@ def main():
                     raise RuntimeError("Lease guard prevents starting the next complete arm")
                 directory = args.results_root / f"round{round_index}-{mode}"
                 command = [sys.executable, str(args.benchmark.resolve()), "--mode", mode,
+                           "--resize-cost-mode", args.resize_cost_mode,
                            "--scope", args.scope, "--smoke-requests", str(args.smoke_requests),
                            "--trace-dir", str(args.trace_dir.resolve()), "--workload-lock", str(args.workload_lock.resolve()),
                            "--runtime-root", str(args.runtime_root.resolve()), "--output-dir", str(directory.resolve()),

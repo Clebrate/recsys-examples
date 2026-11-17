@@ -377,6 +377,7 @@ class SharedCacheMemory:
             decision = policy.observe(window)
             if decision.target_ratio is None:
                 return {"decision": asdict(decision), "action": None}
+            resize_started_s = replay_clock()
             try:
                 result = self.resize_ratio(decision.target_ratio, at_batch_barrier=True)
             except Exception as error:
@@ -384,18 +385,22 @@ class SharedCacheMemory:
                 # A rejection is safe only after verifying the native ledger,
                 # including per-table generations, did not change at all.
                 if after["state"] == "open" and after == actual:
-                    policy.rejected(replay_clock(), "native_preflight_declined")
+                    resize_completed_s = replay_clock()
+                    policy.rejected(resize_completed_s, "native_preflight_declined")
                     return {"decision": asdict(decision), "action": None,
+                            "resize_interval": {"start_s": resize_started_s, "end_s": resize_completed_s,
+                                                "scope": "resize_preflight_declined"},
                             "rejection": {"reason": "native_preflight_declined",
                                           "error": str(error), "unchanged": True}}
                 self._state = "poisoned"
                 raise
             after = result["after"]
+            resize_completed_s = replay_clock()
             receipt = ResizeReceipt(
                 kv_bytes=after["kv"]["payload_bytes"],
                 embedding_bytes=after["embedding"]["payload_bytes"],
                 unused_payload_bytes=after["unused_payload_bytes"],
-                completed_s=replay_clock(),
+                completed_s=resize_completed_s,
                 action_ms=result["action_ms"],
                 preserves_survivors=True,
                 peak_cache_bytes=result["peak_cache_bytes_upper_bound"],
@@ -406,7 +411,9 @@ class SharedCacheMemory:
             except BaseException:
                 self._state = "poisoned"
                 raise
-            return {"decision": asdict(decision), "action": result}
+            return {"decision": asdict(decision), "action": result,
+                    "resize_interval": {"start_s": resize_started_s, "end_s": resize_completed_s,
+                                        "scope": "shared_resize_including_prepare_and_apply"}}
 
     def policy_ratio_bounds(self):
         """Positive KV-batch and NVEmb-chunk bounds from actual reservations."""

@@ -20,6 +20,17 @@ def session_module(name):
     return module
 
 
+class PolicyModeTests(unittest.TestCase):
+    def test_diagnostic_cli_keeps_unknown_cost_and_legacy_default(self):
+        required = ['--trace-dir', '/trace', '--workload-lock', '/lock',
+                    '--runtime-root', '/runtime', '--output-dir', '/out', '--mode', 'adaptive']
+        parser = benchmark.parser()
+        self.assertEqual(parser.parse_args(required).resize_cost_mode, 'amortized')
+        args = parser.parse_args(required + ['--resize-cost-mode', 'diagnostic'])
+        self.assertEqual(args.resize_cost_mode, 'diagnostic')
+        self.assertIsNone(args.resize_calibration)
+
+
 class ArrivalTests(unittest.TestCase):
     def rows(self):
         return [{"request_id": i, "arrival_s": t, "tokens": 10 + i}

@@ -301,6 +301,72 @@ class AdaptivePolicyTests(unittest.TestCase):
             AdaptiveRatioPolicy().observe(window(resize_cost=0.01)).target_ratio
         )
 
+    def test_diagnostic_uses_same_direction_without_cost_gate(self):
+        for cost, old_reason in [(None, "missing_resize_cost"),
+                                 (10**9, "resize_cost_dominates")]:
+            with self.subTest(cost=cost):
+                observed = window(resize_cost=cost)
+                old = AdaptiveRatioPolicy().observe(observed)
+                policy = AdaptiveRatioPolicy(Config(resize_cost_mode="diagnostic"))
+                decision = policy.observe(observed)
+                self.assertEqual(old.reason, old_reason)
+                self.assertIsNone(old.target_ratio)
+                self.assertGreater(decision.target_ratio, 0.5)
+                self.assertEqual(decision.resize_cost_mode, "diagnostic")
+                self.assertEqual(policy.pending[1].resize_cost_ms, cost)
+                self.assertGreater(decision.estimated_saved_work_ms, 0)
+
+    def test_diagnostic_keeps_evidence_and_fullness_guards(self):
+        cases = [
+            (replace(window(resize_cost=None), kv=CacheStats(500000, 500000, 100, None, 10000)),
+             "missing_cache_observation"),
+            (window(kv_resident=100000, resize_cost=None), "receiver_has_free_capacity"),
+            (window(direction=0, resize_cost=None), "balanced_pressure"),
+        ]
+        for observed, reason in cases:
+            with self.subTest(reason=reason):
+                policy = AdaptiveRatioPolicy(Config(resize_cost_mode="diagnostic"))
+                decision = policy.observe(observed)
+                self.assertIsNone(decision.target_ratio)
+                self.assertEqual(decision.reason, reason)
+                self.assertEqual(decision.resize_cost_mode, "diagnostic")
+
+    def test_throughput_reports_observed_deficit_not_direction_or_capacity(self):
+        config = Config(resize_cost_mode="diagnostic")
+        limited = AdaptiveRatioPolicy(config).observe(window(arrivals=100, completed=100))
+        growing = AdaptiveRatioPolicy(config).observe(
+            window(arrivals=200, completed=100, queue_end=100)
+        )
+        self.assertTrue(limited.input_limited)
+        self.assertEqual(limited.completion_rate_rps, 50)
+        self.assertEqual(limited.arrival_rate_rps, 50)
+        self.assertEqual(limited.completion_deficit_rps, 0)
+        self.assertFalse(growing.input_limited)
+        self.assertEqual(growing.completion_rate_rps, 50)
+        self.assertEqual(growing.arrival_rate_rps, 100)
+        self.assertEqual(growing.completion_deficit_rps, 50)
+        # Identical reuse evidence yields identical direction and size; the
+        # unmatched observed rates are not treated as predicted ratio benefit.
+        self.assertEqual(limited.target_ratio, growing.target_ratio)
+        self.assertEqual(limited.estimated_saved_work_ms, growing.estimated_saved_work_ms)
+
+    def test_collected_throughput_uses_whole_accumulated_window(self):
+        policy = AdaptiveRatioPolicy(Config(resize_cost_mode="diagnostic"))
+        first = policy.observe(window(0, 1, arrivals=30, completed=20, queue_end=10))
+        self.assertEqual(first.reason, "collecting_window")
+        self.assertEqual(first.completion_rate_rps, 20)
+        second = policy.observe(window(1, 2, arrivals=10, completed=20, queue_start=10))
+        self.assertEqual(second.completion_rate_rps, 20)
+        self.assertEqual(second.arrival_rate_rps, 20)
+        self.assertEqual(second.completion_deficit_rps, 0)
+
+    def test_cost_mode_validation_does_not_relax_numeric_settings(self):
+        for mode in [None, "off", 0, True]:
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                Config(resize_cost_mode=mode)
+        with self.assertRaises(ValueError):
+            Config(resize_cost_mode="diagnostic", initial_step=float("nan"))
+
     def test_unused_receiver_capacity_prevents_another_grant(self):
         result = AdaptiveRatioPolicy().observe(window(kv_resident=100000))
         self.assertIsNone(result.target_ratio)
@@ -444,6 +510,18 @@ class AdaptivePolicyTests(unittest.TestCase):
         policy.applied(applied)
         self.assertEqual(policy.interval_s, 20)
         self.assertEqual(policy.next_check_s, 32)
+
+    def test_diagnostic_action_cost_does_not_extend_interval_but_fill_still_gates(self):
+        policy = AdaptiveRatioPolicy(Config(resize_cost_mode="diagnostic"))
+        policy.observe(window(resize_cost=None))
+        applied = receipt(policy, completed_s=12, action_ms=10000)
+        policy.applied(applied)
+        self.assertEqual(policy.interval_s, 2)
+        self.assertEqual(policy.next_check_s, 14)
+        decision = policy.observe(window(2, 14, kv_bytes=applied.kv_bytes,
+                                         kv_resident=500000, resize_cost=None))
+        self.assertEqual(decision.reason, "waiting_for_fill")
+        self.assertIsNone(decision.target_ratio)
 
     def test_proposal_does_not_change_ratio_before_receipt(self):
         policy = AdaptiveRatioPolicy()

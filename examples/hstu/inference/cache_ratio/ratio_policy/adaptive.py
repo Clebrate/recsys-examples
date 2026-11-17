@@ -88,6 +88,21 @@ class Window:
             self.budget_bytes - self.kv.capacity_bytes - self.embedding.capacity_bytes
         )
 
+    def throughput(self):
+        """Observed rates, not a prediction or a service-capacity estimate.
+
+        input_limited only flags empty queue boundaries with no completion
+        deficit. Transient queues within the window can still have occurred.
+        """
+        duration = self.end_s - self.start_s
+        return {
+            "completion_rate_rps": self.completed / duration,
+            "arrival_rate_rps": self.arrivals / duration,
+            "completion_deficit_rps": max(0, self.arrivals - self.completed) / duration,
+            "input_limited": self.queue_at_start == self.queue_at_end == 0
+            and self.completed >= self.arrivals,
+        }
+
     def validate(self):
         for value in (self.start_s, self.end_s, self.mean_request_tokens):
             if type(value) not in (int, float) or not isfinite(value) or value < 0:
@@ -134,9 +149,14 @@ class Config:
     drift_factor: float = 1.5
     min_reuse_units: int = 16
     cost_margin: float = 2.0
+    resize_cost_mode: str = "amortized"
 
     def __post_init__(self):
+        if self.resize_cost_mode not in ("amortized", "diagnostic"):
+            raise ValueError("Invalid resize cost mode")
         for name, value in vars(self).items():
+            if name == "resize_cost_mode":
+                continue
             if type(value) not in (int, float) or not isfinite(value):
                 raise ValueError("Invalid policy setting: " + name)
         if not 0 <= self.min_ratio < self.max_ratio <= 1:
@@ -162,6 +182,11 @@ class Decision:
     next_check_s: float
     pressure_balance: float = 0.0
     estimated_saved_work_ms: float = 0.0  # Local heuristic, NOT queue/E2E benefit.
+    resize_cost_mode: str = "amortized"
+    completion_rate_rps: Optional[float] = None
+    arrival_rate_rps: Optional[float] = None
+    completion_deficit_rps: Optional[float] = None
+    input_limited: Optional[bool] = None  # Window-boundary hint, not proven capacity.
 
 
 @dataclass(frozen=True)
@@ -216,13 +241,22 @@ class AdaptiveRatioPolicy:
         self.proposals = 0
         self.applied_actions = 0
         self.holds = {}
+        self._throughput = {}
+
+    def _decision(self, target, reason, check, balance=0.0, saving=0.0,
+                  throughput=None):
+        return Decision(
+            target, reason, check, balance, saving,
+            resize_cost_mode=self.config.resize_cost_mode,
+            **(self._throughput if throughput is None else throughput),
+        )
 
     def _hold(self, now, reason, backoff=False, balance=0.0, saving=0.0):
         if backoff:
             self.interval_s = min(self.config.max_interval_s, self.interval_s * 1.5)
         self.next_check_s = now + self.interval_s
         self.holds[reason] = self.holds.get(reason, 0) + 1
-        return Decision(None, reason, self.next_check_s, balance, saving)
+        return self._decision(None, reason, self.next_check_s, balance, saving)
 
     def _accumulate(self, w):
         old = self._window
@@ -290,7 +324,8 @@ class AdaptiveRatioPolicy:
         if not c.min_ratio <= ratio <= c.max_ratio:
             raise ValueError("Current ratio is outside supported bounds")
         if self.pending is not None:
-            return Decision(None, "awaiting_resize_receipt", self.next_check_s)
+            return self._decision(None, "awaiting_resize_receipt", self.next_check_s,
+                                  throughput=w.throughput())
         if self._last_end is not None and w.start_s > self._last_end:
             # Do not treat an unobserved gap as a period of zero misses/arrivals.
             self._window = None
@@ -300,6 +335,7 @@ class AdaptiveRatioPolicy:
         self._embedding_bytes = w.embedding.capacity_bytes
         self.unused_payload_bytes = w.unused_payload_bytes
         w = self._accumulate(w)
+        self._throughput = w.throughput()
         duration = w.end_s - w.start_s
         context = (w.arrivals / duration, w.mean_request_tokens)
         drift = self._context is not None and any(
@@ -313,7 +349,7 @@ class AdaptiveRatioPolicy:
         earliest = (self._last_evaluation or w.start_s) + c.min_interval_s
         if w.end_s < earliest or (not urgent and w.end_s < self.next_check_s):
             check = earliest if urgent else max(earliest, self.next_check_s)
-            return Decision(None, "collecting_window", check)
+            return self._decision(None, "collecting_window", check)
         self._last_evaluation, self._context = w.end_s, context
         self._window = None
         if not w.completed:
@@ -372,7 +408,7 @@ class AdaptiveRatioPolicy:
                 backoff=not urgent,
                 balance=balance,
             )
-        if w.resize_cost_ms is None:
+        if c.resize_cost_mode == "amortized" and w.resize_cost_ms is None:
             return self._hold(w.end_s, "missing_resize_cost", balance=balance)
         step = self.step
         if self._direction:
@@ -390,7 +426,10 @@ class AdaptiveRatioPolicy:
             )
         # Amortize over one observed window, never an invented long future phase.
         saving = abs(p_kv - p_emb) * transfer * duration
-        if saving <= c.cost_margin * w.resize_cost_ms:
+        # Diagnostic mode tests the same evidence-based direction while keeping
+        # real resize pauses in measured performance. Missing cost stays None.
+        if (c.resize_cost_mode == "amortized"
+                and saving <= c.cost_margin * w.resize_cost_ms):
             return self._hold(
                 w.end_s,
                 "resize_cost_dominates",
@@ -400,7 +439,7 @@ class AdaptiveRatioPolicy:
             )
         self.step = step
         self.next_check_s = w.end_s + c.min_interval_s
-        decision = Decision(
+        decision = self._decision(
             target, "eviction_reuse_pressure", self.next_check_s, balance, saving
         )
         self.pending = (decision, w)
@@ -486,10 +525,12 @@ class AdaptiveRatioPolicy:
         self._window = None
         self._last_evaluation = receipt.completed_s
         self._pressure = None
-        self.interval_s = min(
-            c.max_interval_s,
-            max(c.min_interval_s, c.cost_margin * receipt.action_ms / 1000),
-        )
+        self.interval_s = c.min_interval_s
+        if c.resize_cost_mode == "amortized":
+            self.interval_s = min(
+                c.max_interval_s,
+                max(c.min_interval_s, c.cost_margin * receipt.action_ms / 1000),
+            )
         self.next_check_s = receipt.completed_s + self.interval_s
 
     def rejected(self, now_s, reason="planner_declined"):
